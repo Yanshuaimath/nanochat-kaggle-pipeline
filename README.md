@@ -1,133 +1,177 @@
-# Nanochat End-to-End LLM Pipeline
+# Nanochat Kaggle Pipeline
 
-This repository packages a Kaggle-focused end-to-end LLM workflow built around the `nanochat` codebase.
+This repository packages a Kaggle-ready, end-to-end `nanochat` pipeline.
 
-The project is centered on two artifacts:
+The project is built around two artifacts:
 
-- [nanochat-run.ipynb](./nanochat-run.ipynb): the Kaggle notebook that runs the pipeline
-- [kaggle_dataset/](./kaggle_dataset): the Kaggle dataset bundle mounted by the notebook
+- [nanochat-run.ipynb](./nanochat-run.ipynb), the notebook you run on Kaggle
+- [kaggle_dataset/](./kaggle_dataset), the local Kaggle dataset package included in this repo
 
-The goal is not a large-scale final model. This project is a working small-scale pipeline that validates the full code path on Kaggle with `2x Tesla T4` GPUs.
+The goal is pipeline validation, not training a strong final model. The notebook is intentionally small enough to exercise the full code path on Kaggle with `2x Tesla T4` GPUs.
 
-## What The Notebook Covers
+## Acknowledgement
 
-The notebook walks through:
+This repository builds on [karpathy/nanochat](https://github.com/karpathy/nanochat) and extends it with a Kaggle-oriented workflow, including dataset packaging, notebook execution, compact end-to-end validation, post-training branches, quantization, and serving entrypoints.
 
-1. downloading a small pretraining slice
-2. training and evaluating the tokenizer
-3. base-model pretraining and evaluation
-4. supervised fine-tuning
-5. chat evaluation
-6. distillation data generation and distillation
-7. preference data generation and DPO
-8. post-training comparison
-9. quantization and quantized evaluation
-10. RL branch smoke tests
-11. serving entrypoints
-12. AWQ code-path testing
+## What The Notebook Actually Does
 
-## Repository Layout
+The notebook is the source of truth for this repo. It runs the following stages:
+
+1. verify the mounted Kaggle dataset and copy it into `/kaggle/working/nanochat`
+2. configure caches under `/kaggle/working/nanochat_cache` and `/kaggle/working/huggingface_cache`
+3. prompt for a Hugging Face token
+4. install the Python dependencies needed in the Kaggle runtime
+5. download a small pretraining slice with `python -m nanochat.dataset -n 8`
+6. train and evaluate the tokenizer
+7. pretrain a small `d8` base model
+8. evaluate the base model on reduced Kaggle-friendly settings
+9. download identity conversations and run chat SFT
+10. evaluate the SFT chat model
+11. install distillation extras and generate tiny teacher datasets
+12. run a small distillation branch
+13. generate preference data and run a tiny DPO branch
+14. compare SFT, distill, and DPO outputs
+15. quantize the distilled checkpoint and run a tiny AWQ smoke test
+16. evaluate the quantized artifact
+17. run tiny RL smoke tests for `chat_rl.py`, `chat_universal_rl.py`, and `chat_ppo.py`
+18. print serving commands for full-precision and quantized web apps
+
+The last two serving cells are intentionally non-blocking examples. They print the commands but do not launch the web servers automatically.
+
+## Repo Layout
 
 ```text
 .
 ├── README.md
 ├── nanochat-run.ipynb
-└── kaggle_dataset
+└── kaggle_dataset/
     ├── dataset-metadata.json
-    └── nanochat
+    └── nanochat/
         ├── pyproject.toml
-        ├── nanochat
-        ├── scripts
-        ├── tasks
-        └── tests
-        
+        ├── nanochat/
+        ├── scripts/
+        ├── tasks/
+        └── tests/
 ```
 
-## Kaggle Workflow
+One slightly unusual detail: the uploadable Kaggle dataset package is `kaggle_dataset/`, but the actual code lives inside `kaggle_dataset/nanochat/`. After publishing, Kaggle mounts that dataset as a folder named `nanochat-codes`, and the notebook copies that mounted content into `/kaggle/working/nanochat`.
 
-### 1. Upload the dataset
+## Dataset Setup
 
-The notebook expects the Kaggle dataset bundle contained in [kaggle_dataset/](./kaggle_dataset).
+Before running the notebook, configure Kaggle with:
 
-From a terminal with the Kaggle CLI configured:
+- GPU enabled
+- internet enabled
+- your uploaded `nanochat-codes` dataset attached
 
-```bash
-kaggle datasets version -p kaggle_dataset -m "update nanochat Kaggle dataset" --dir-mode zip
+The dataset mapping is:
+
+- local packaging directory in this repo: `kaggle_dataset/`
+- code inside that package: `kaggle_dataset/nanochat/`
+- Kaggle dataset name: `nanochat-codes`
+- mounted Kaggle path pattern: `/kaggle/input/datasets/<your-kaggle-username>/nanochat-codes`
+
+The notebook auto-detects the attached dataset from this mounted path pattern:
+
+```python
+/kaggle/input/datasets/<your-kaggle-username>/nanochat-codes
 ```
 
-This bundle is intended to be published as:
-
-- dataset slug: `yshuaiqin/nanochat-codes`
-
-In Kaggle, the mounted path used by the notebook is:
+For example, with the author's Kaggle account:
 
 ```python
 /kaggle/input/datasets/yshuaiqin/nanochat-codes
 ```
 
-### 2. Upload the notebook
+In this repository, the mounted Kaggle dataset `nanochat-codes` is expected to contain the same project files that live under [`kaggle_dataset/nanochat/`](./kaggle_dataset/nanochat).
 
-Push [nanochat-run.ipynb](./nanochat-run.ipynb) as a Kaggle notebook that depends on the dataset above.
+Early in the notebook, you will also be prompted for `HF_TOKEN`.
 
-Typical CLI flow:
+## How To Publish The Dataset Bundle
 
-```bash
-kaggle kernels push -p <your-notebook-folder>
+This repo includes Kaggle dataset metadata at [kaggle_dataset/dataset-metadata.json](./kaggle_dataset/dataset-metadata.json).
+
+For the author's Kaggle account, the dataset id is:
+
+```text
+yshuaiqin/nanochat-codes
 ```
 
-The notebook should be configured with:
+If you publish under your own Kaggle account, the dataset id becomes:
 
-- GPU enabled
-- internet enabled
-- dataset source `yshuaiqin/nanochat-codes`
+```text
+<your-kaggle-username>/nanochat-codes
+```
 
-### 3. Run the notebook on Kaggle
-
-Inside Kaggle, the notebook:
-
-- copies the mounted dataset repo into `/kaggle/working/nanochat`
-- uses `/kaggle/working/nanochat_cache` as the main cache/checkpoint directory
-- uses `/kaggle/working/huggingface_cache` for Hugging Face caches
-- sets `NANOCHAT_DTYPE=float16` for `Tesla T4`
-
-## Kaggle-Specific Notes
-
-### SFT startup fix
-
-The standard SFT path was fragile in the Kaggle notebook environment because distributed workers could stall during Hugging Face dataset loading.
-
-To make this reliable, the dataset bundle includes:
-
-- [kaggle_dataset/nanochat/scripts/chat_sft_updated.py](./kaggle_dataset/nanochat/scripts/chat_sft_updated.py)
-
-This version adds a Kaggle-safe dataset warmup path before distributed SFT starts.
-
-### Important SFT batch setting
-
-For the validated `d8` / `2x T4` setup, the notebook uses:
+Typical update flow:
 
 ```bash
+kaggle datasets version -p kaggle_dataset -m "update nanochat Kaggle dataset" --dir-mode zip
+```
+
+This command publishes the local packaging directory `kaggle_dataset/`. After publishing, attach the resulting Kaggle dataset `nanochat-codes` to the notebook. The notebook then reads the mounted dataset from `/kaggle/input/datasets/<your-kaggle-username>/nanochat-codes`.
+
+Then push the notebook separately as a Kaggle kernel that depends on that dataset.
+
+## Key Runtime Choices In The Notebook
+
+The notebook makes a few environment assumptions explicitly:
+
+- `NANOCHAT_DTYPE=float16` for Tesla T4 compatibility
+- `torchrun --nproc_per_node=2` for Kaggle's 2 GPUs
+- short iteration counts and reduced eval sizes to keep the run practical
+- `--run=dummy` in training stages so the notebook does not require a Weights & Biases login
+
+The base-model stage uses a small `d8` configuration with conservative settings such as:
+
+```text
+--depth=8
+--device-batch-size=2
+--max-seq-len=1024
+--num-iterations=50
+```
+
+The chat SFT stage uses:
+
+```text
 --device-batch-size=2
 --total-batch-size=4096
 --num-iterations=20
+--mmlu-epochs=1
+--gsm8k-epochs=1
 ```
 
-The `--total-batch-size=4096` setting matters because it makes the effective SFT iteration count behave as intended in this environment.
+That `--total-batch-size=4096` choice is important in this notebook because it gives the intended effective step count under gradient accumulation.
 
-## Validated Small-Scale Pipeline
+## Kaggle-Specific SFT Fix
 
-This repository captures a successful small-scale validation run, not a fully trained production model.
+The notebook does not use the default SFT entrypoint. It uses [kaggle_dataset/nanochat/scripts/chat_sft_updated.py](./kaggle_dataset/nanochat/scripts/chat_sft_updated.py) instead.
 
-What is validated:
+This variant adds a single-rank warmup for Hugging Face-backed SFT datasets before distributed workers begin loading them. In notebook environments like Kaggle, that reduces failures caused by multiple workers trying to create caches or download data at the same time.
 
-- each major pipeline stage runs successfully on Kaggle
-- checkpoints are written correctly
-- evaluation reports are saved correctly
-- post-training branches execute successfully at smoke-test scale
+## What This Repo Validates
 
-What is not claimed:
+This repository is best understood as a small-scale systems check for the full training and post-training pipeline.
+
+Validated by the notebook:
+
+- tokenizer training and evaluation
+- base-model train and eval flow
+- chat SFT and chat eval flow
+- distillation data generation and student training
+- preference data generation and DPO flow
+- post-training comparison reports
+- quantization and quantized evaluation
+- RL code-path smoke tests
+- serving entrypoints for full-precision and quantized models
+
+Not claimed by this repo:
 
 - strong benchmark performance
 - large-scale training quality
-- final-model readiness
+- production-ready checkpoints
+- quality conclusions from the tiny Kaggle-scale post-training runs
 
+## If You Want To Inspect Or Modify The Pipeline
+
+Start with [nanochat-run.ipynb](./nanochat-run.ipynb). It already contains the exact commands, paths, and reduced settings used for the Kaggle validation run, so it is the best place to adjust batch sizes, iteration counts, model tags, or which stages you want to keep.
