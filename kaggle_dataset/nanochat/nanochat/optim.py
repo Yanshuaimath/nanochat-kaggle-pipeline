@@ -7,9 +7,45 @@ Addapted from: https://github.com/KellerJordan/modded-nanogpt
 Further contributions from @karpathy and @chrisjmccormick.
 """
 
+import os
+import time
+
 import torch
 import torch.distributed as dist
 from torch import Tensor
+
+# -----------------------------------------------------------------------------
+# Distributed optimizer debugging
+# Enable with NANOCHAT_DEBUG_DIST=1. Logs go to per-rank files under /kaggle/working.
+_DEBUG_DIST = os.environ.get("NANOCHAT_DEBUG_DIST", "0") == "1"
+_DEBUG_STDOUT = os.environ.get("NANOCHAT_DEBUG_STDOUT", "0") == "1"
+_ADAMW_ALLREDUCE = os.environ.get("NANOCHAT_ADAMW_ALLREDUCE", "0") == "1"
+_SERIAL_OPTIM_COMM = os.environ.get("NANOCHAT_SERIAL_OPTIM_COMM", "0") == "1"
+
+def _debug_rank_info():
+    rank = int(os.environ.get("RANK", "-1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    return rank, local_rank, world
+
+def _debug_log(msg: str) -> None:
+    if not _DEBUG_DIST:
+        return
+    rank, local_rank, world = _debug_rank_info()
+    line = f"[OPTDBG {time.strftime('%H:%M:%S')} rank={rank}/{world} local={local_rank}] {msg}"
+    try:
+        with open(f"/kaggle/working/nanochat_optim_debug_rank{rank}.log", "a") as f:
+            f.write(line + "\n")
+            f.flush()
+    except Exception:
+        pass
+    if _DEBUG_STDOUT:
+        print(line, flush=True)
+
+def _tensor_desc(t: Tensor | None) -> str:
+    if t is None:
+        return "None"
+    return f"shape={tuple(t.shape)} numel={t.numel()} dtype={t.dtype} device={t.device}"
 
 # -----------------------------------------------------------------------------
 """
@@ -365,27 +401,89 @@ class DistMuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._debug_step = 0
 
-    def _reduce_adamw(self, group: dict, world_size: int) -> dict:
+    def _reduce_adamw(self, group: dict, world_size: int, group_idx: int) -> dict:
         """Launch async reduce ops for AdamW group. Returns info dict with per-param infos."""
         param_infos = {}
-        for p in group['params']:
+        params = group['params']
+        grads = []
+        for param_idx, p in enumerate(params):
             grad = p.grad
-            if p.numel() < 1024:
-                # Small params: all_reduce (no scatter/gather needed)
+            if grad is None:
+                _debug_log(f"step={self._debug_step} adamw group={group_idx} param={param_idx} grad=None")
+                raise RuntimeError(f"AdamW parameter has no gradient: group={group_idx} param={param_idx}")
+            grads.append(grad)
+
+        total_numel = sum(g.numel() for g in grads)
+        can_all_reduce_group = all(p.numel() < 1024 or _ADAMW_ALLREDUCE for p in params)
+        if _SERIAL_OPTIM_COMM and can_all_reduce_group and len(params) > 1 and total_numel < 4096:
+            flat_grad = torch.cat([g.reshape(-1) for g in grads])
+            _debug_log(
+                f"step={self._debug_step} ENTER adamw_packed_all_reduce "
+                f"group={group_idx} params={len(params)} flat_{_tensor_desc(flat_grad)}"
+            )
+            dist.all_reduce(flat_grad, op=dist.ReduceOp.AVG)
+            _debug_log(f"step={self._debug_step} DONE adamw_packed_all_reduce group={group_idx}")
+
+            offset = 0
+            for param_idx, (p, grad) in enumerate(zip(params, grads)):
+                next_offset = offset + grad.numel()
+                grad_slice = flat_grad[offset:next_offset].view_as(grad)
+                param_infos[p] = dict(
+                    future=None,
+                    grad_slice=grad_slice,
+                    is_small=True,
+                    param_idx=param_idx,
+                    group_idx=group_idx,
+                )
+                offset = next_offset
+            return dict(param_infos=param_infos, flat_grad=flat_grad)
+
+        for param_idx, p in enumerate(group['params']):
+            grad = p.grad
+            if p.numel() < 1024 or _ADAMW_ALLREDUCE:
+                # Small params, or Kaggle-safe fallback: all_reduce gradients and
+                # update the full AdamW parameter on every rank. This avoids the
+                # large-param all_gather path, which can hang on Kaggle 2xT4.
+                _debug_log(
+                    f"step={self._debug_step} ENTER adamw_all_reduce "
+                    f"group={group_idx} param={param_idx} param_{_tensor_desc(p)} grad_{_tensor_desc(grad)}"
+                )
                 future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
-                param_infos[p] = dict(future=future, grad_slice=grad, is_small=True)
+                _debug_log(
+                    f"step={self._debug_step} RETURN adamw_all_reduce "
+                    f"group={group_idx} param={param_idx} replicated={_ADAMW_ALLREDUCE and p.numel() >= 1024}"
+                )
+                if _SERIAL_OPTIM_COMM:
+                    _debug_log(f"step={self._debug_step} WAIT immediate adamw_all_reduce group={group_idx} param={param_idx}")
+                    future.wait()
+                    _debug_log(f"step={self._debug_step} DONE immediate adamw_all_reduce group={group_idx} param={param_idx}")
+                param_infos[p] = dict(future=future, grad_slice=grad, is_small=True, param_idx=param_idx, group_idx=group_idx)
             else:
                 # Large params: reduce_scatter
                 assert grad.shape[0] % world_size == 0, f"AdamW reduce_scatter requires shape[0] ({grad.shape[0]}) divisible by world_size ({world_size})"
                 rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])
+                _debug_log(
+                    f"step={self._debug_step} ENTER adamw_reduce_scatter "
+                    f"group={group_idx} param={param_idx} param_{_tensor_desc(p)} grad_{_tensor_desc(grad)}"
+                )
                 future = dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
-                param_infos[p] = dict(future=future, grad_slice=grad_slice, is_small=False)
+                _debug_log(
+                    f"step={self._debug_step} RETURN adamw_reduce_scatter "
+                    f"group={group_idx} param={param_idx} grad_slice_{_tensor_desc(grad_slice)}"
+                )
+                if _SERIAL_OPTIM_COMM:
+                    _debug_log(f"step={self._debug_step} WAIT immediate adamw_reduce_scatter group={group_idx} param={param_idx}")
+                    future.wait()
+                    _debug_log(f"step={self._debug_step} DONE immediate adamw_reduce_scatter group={group_idx} param={param_idx}")
+                param_infos[p] = dict(future=future, grad_slice=grad_slice, is_small=False, param_idx=param_idx, group_idx=group_idx)
         return dict(param_infos=param_infos)
 
-    def _reduce_muon(self, group: dict, world_size: int) -> dict:
+    def _reduce_muon(self, group: dict, world_size: int, group_idx: int) -> dict:
         """Launch async reduce op for Muon group. Returns info dict."""
+        _debug_log(f"step={self._debug_step} ENTER reduce_muon group={group_idx}")
         params = group['params']
         chunk_size = (len(params) + world_size - 1) // world_size
         padded_num_params = chunk_size * world_size
@@ -393,24 +491,52 @@ class DistMuonAdamW(torch.optim.Optimizer):
         shape, device, dtype = p.shape, p.device, p.dtype
 
         # Stack grads and zero-pad to padded_num_params
+        _debug_log(f"step={self._debug_step} PREP muon_stack group={group_idx} params={len(params)} shape={shape}")
         grad_stack = torch.stack([p.grad for p in params])
+        _debug_log(f"step={self._debug_step} DONE muon_stack group={group_idx} grad_stack_{_tensor_desc(grad_stack)}")
+        _debug_log(f"step={self._debug_step} PREP muon_stacked_grads_alloc group={group_idx} padded_num_params={padded_num_params}")
         stacked_grads = torch.empty(padded_num_params, *shape, dtype=dtype, device=device)
+        _debug_log(f"step={self._debug_step} DONE muon_stacked_grads_alloc group={group_idx} stacked_grads_{_tensor_desc(stacked_grads)}")
+        _debug_log(f"step={self._debug_step} PREP muon_stacked_grads_copy group={group_idx}")
         stacked_grads[:len(params)].copy_(grad_stack)
+        _debug_log(f"step={self._debug_step} DONE muon_stacked_grads_copy group={group_idx}")
         if len(params) < padded_num_params:
+            _debug_log(f"step={self._debug_step} PREP muon_stacked_grads_zero_pad group={group_idx}")
             stacked_grads[len(params):].zero_()
+            _debug_log(f"step={self._debug_step} DONE muon_stacked_grads_zero_pad group={group_idx}")
 
         # Reduce_scatter to get this rank's chunk
+        _debug_log(f"step={self._debug_step} PREP muon_grad_chunk_alloc group={group_idx} chunk_size={chunk_size}")
         grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
+        _debug_log(f"step={self._debug_step} DONE muon_grad_chunk_alloc group={group_idx} grad_chunk_{_tensor_desc(grad_chunk)}")
+        _debug_log(
+            f"step={self._debug_step} ENTER muon_reduce_scatter "
+            f"group={group_idx} params={len(params)} chunk_size={chunk_size} "
+            f"stacked_grads_{_tensor_desc(stacked_grads)}"
+        )
         future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
+        _debug_log(
+            f"step={self._debug_step} RETURN muon_reduce_scatter "
+            f"group={group_idx} grad_chunk_{_tensor_desc(grad_chunk)}"
+        )
+        if _SERIAL_OPTIM_COMM:
+            _debug_log(f"step={self._debug_step} WAIT immediate muon_reduce_scatter group={group_idx}")
+            future.wait()
+            _debug_log(f"step={self._debug_step} DONE immediate muon_reduce_scatter group={group_idx}")
 
-        return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size)
+        return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size, group_idx=group_idx)
 
     def _compute_adamw(self, group: dict, info: dict, gather_list: list, rank: int, world_size: int) -> None:
         """Wait for reduce, compute AdamW updates, launch gathers for large params."""
         param_infos = info['param_infos']
         for p in group['params']:
             pinfo = param_infos[p]
-            pinfo['future'].wait()
+            group_idx = pinfo['group_idx']
+            param_idx = pinfo['param_idx']
+            _debug_log(f"step={self._debug_step} WAIT adamw_reduce group={group_idx} param={param_idx} small={pinfo['is_small']}")
+            if pinfo['future'] is not None:
+                pinfo['future'].wait()
+            _debug_log(f"step={self._debug_step} DONE adamw_reduce group={group_idx} param={param_idx} small={pinfo['is_small']}")
             grad_slice = pinfo['grad_slice']
             state = self.state[p]
 
@@ -443,12 +569,29 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
             # Large params need all_gather
             if not pinfo['is_small']:
-                future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
-                gather_list.append(dict(future=future, params=None))
+                gathered_param = torch.empty_like(p)
+                _debug_log(
+                    f"step={self._debug_step} ENTER adamw_all_gather "
+                    f"group={group_idx} param={param_idx} output_{_tensor_desc(gathered_param)} input_{_tensor_desc(p_slice)}"
+                )
+                future = dist.all_gather_into_tensor(gathered_param, p_slice, async_op=True).get_future()
+                _debug_log(f"step={self._debug_step} RETURN adamw_all_gather group={group_idx} param={param_idx}")
+                gather_list.append(dict(
+                    future=future,
+                    param=p,
+                    gathered_param=gathered_param,
+                    params=None,
+                    kind="adamw",
+                    group_idx=group_idx,
+                    param_idx=param_idx,
+                ))
 
     def _compute_muon(self, group: dict, info: dict, gather_list: list, rank: int) -> None:
         """Wait for reduce, compute Muon updates, launch gather."""
+        group_idx = info["group_idx"]
+        _debug_log(f"step={self._debug_step} WAIT muon_reduce group={group_idx}")
         info['future'].wait()
+        _debug_log(f"step={self._debug_step} DONE muon_reduce group={group_idx}")
         params = group['params']
         chunk_size = info['chunk_size']
         grad_chunk = info['grad_chunk']
@@ -493,14 +636,30 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
         # Reuse stacked_grads buffer for all_gather output
         stacked_params = info["stacked_grads"]
+        _debug_log(f"step={self._debug_step} ENTER muon_all_gather group={group_idx}")
         future = dist.all_gather_into_tensor(stacked_params, updated_params, async_op=True).get_future()
-        gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
+        _debug_log(f"step={self._debug_step} RETURN muon_all_gather group={group_idx}")
+        if _SERIAL_OPTIM_COMM:
+            _debug_log(f"step={self._debug_step} WAIT immediate muon_all_gather group={group_idx}")
+            future.wait()
+            _debug_log(f"step={self._debug_step} DONE immediate muon_all_gather group={group_idx}")
+        gather_list.append(dict(future=future, stacked_params=stacked_params, params=params, kind="muon", group_idx=group_idx, param_idx=None))
 
     def _finish_gathers(self, gather_list: list) -> None:
         """Wait for all gathers and copy Muon params back."""
         for info in gather_list:
+            _debug_log(
+                f"step={self._debug_step} WAIT {info['kind']}_gather "
+                f"group={info['group_idx']} param={info['param_idx']}"
+            )
             info["future"].wait()
-            if info["params"] is not None:
+            _debug_log(
+                f"step={self._debug_step} DONE {info['kind']}_gather "
+                f"group={info['group_idx']} param={info['param_idx']}"
+            )
+            if info["kind"] == "adamw":
+                info["param"].copy_(info["gathered_param"])
+            elif info["params"] is not None:
                 # Muon: copy from stacked buffer back to individual params
                 torch._foreach_copy_(info["params"], list(info["stacked_params"][:len(info["params"])].unbind(0)))
 
@@ -508,14 +667,20 @@ class DistMuonAdamW(torch.optim.Optimizer):
     def step(self):
         rank = dist.get_rank()
         world_size = dist.get_world_size()
+        self._debug_step += 1
+        _debug_log(f"BEGIN optimizer.step internal_step={self._debug_step} groups={len(self.param_groups)}")
 
         # Phase 1: launch all async reduce ops
         reduce_infos: list[dict] = []
-        for group in self.param_groups:
+        for group_idx, group in enumerate(self.param_groups):
+            _debug_log(
+                f"step={self._debug_step} REDUCE_PHASE group={group_idx} "
+                f"kind={group['kind']} params={len(group['params'])}"
+            )
             if group['kind'] == 'adamw':
-                reduce_infos.append(self._reduce_adamw(group, world_size))
+                reduce_infos.append(self._reduce_adamw(group, world_size, group_idx))
             elif group['kind'] == 'muon':
-                reduce_infos.append(self._reduce_muon(group, world_size))
+                reduce_infos.append(self._reduce_muon(group, world_size, group_idx))
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
@@ -531,3 +696,4 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
         # Phase 3: wait for gathers, copy back
         self._finish_gathers(gather_list)
+        _debug_log(f"END optimizer.step internal_step={self._debug_step}")

@@ -1,0 +1,15 @@
+{
+  "id": "yshuaiqin/nanochat-d8-pretraining",
+  "title": "nanochat d8 pretraining",
+  "code_file": "nanochat_d8_pretraining.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "yshuaiqin/nanochat-codes"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

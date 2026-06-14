@@ -148,7 +148,10 @@ for name, fallback, source in [
         print0(f"Using {name}={arg_val}")
 
 orig_model = model
-model = torch.compile(model, dynamic=False)
+if os.environ.get("NANOCHAT_DISABLE_COMPILE") == "1":
+    print0("torch.compile disabled by NANOCHAT_DISABLE_COMPILE=1")
+else:
+    model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -182,7 +185,7 @@ if args.load_optimizer:
         print0("WARNING: optimizer checkpoint not found, starting with fresh optimizer (slightly worse)")
 
 # GradScaler for fp16 training (bf16/fp32 don't need it)
-scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
+scaler = torch.amp.GradScaler("cuda", init_scale=1024) if COMPUTE_DTYPE == torch.float16 else None
 if scaler is not None:
     print0("GradScaler enabled for fp16 training")
 
@@ -249,13 +252,15 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         nonlocal cursor, epoch
         while len(conv_buffer) < buffer_size:
             conversation = dataset[cursor]
-            ids, mask = tokenizer.render_conversation(conversation)
-            conv_buffer.append((ids, mask))
+            ids, mask = tokenizer.render_conversation(conversation, max_tokens=row_capacity)
             cursor += ddp_world_size
             if cursor >= dataset_size:
                 cursor = cursor % dataset_size
                 epoch += 1
                 # Note: last_step is now triggered based on consumption, not fetching
+            if not any(mask[1:]):
+                continue
+            conv_buffer.append((ids, mask))
 
     while True:
         rows = []

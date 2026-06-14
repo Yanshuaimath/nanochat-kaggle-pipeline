@@ -20,7 +20,18 @@ python3 -m scripts.chat_quantize --checkpoint-dir ~/.cache/nanochat/chatdpo_chec
 import argparse
 import json
 import os
-from typing import Dict, Tuple
+from typing import Dict
+
+
+def parse_bool_arg(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in {"1", "true", "yes", "y"}:
+        return True
+    if value in {"0", "false", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError("expected a boolean value: 0/1, true/false, yes/no")
 
 
 def parse_args():
@@ -30,7 +41,14 @@ def parse_args():
     parser.add_argument("--model-tag", type=str, default=None, help="Model tag inside the checkpoint root")
     parser.add_argument("--step", type=int, default=None, help="Checkpoint step")
     parser.add_argument("--method", type=str, default="int8_linear", choices=["int8_sym", "int8_linear", "fp16_copy"])
-    parser.add_argument("--quantize-embeddings", type=int, default=0, help="Include 2D embedding tables when using int8_linear")
+    parser.add_argument(
+        "--quantize-embeddings",
+        nargs="?",
+        const=True,
+        default=False,
+        type=parse_bool_arg,
+        help="For int8_linear, include 2D embedding tables. int8_sym/fp16_copy always process all floating tensors.",
+    )
     parser.add_argument("--output-dir", type=str, default=None, help="Directory for exported quantized artifacts")
     parser.add_argument("--suffix", type=str, default="", help="Optional suffix for export directory naming")
     return parser.parse_args()
@@ -74,6 +92,19 @@ def load_checkpoint_state(root_dir, model_tag, step):
         step = find_last_step(checkpoint_dir)
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, step, torch.device("cpu"), load_optimizer=False)
     return checkpoint_dir, model_tag, step, model_data, meta_data
+
+
+def strip_orig_mod_prefix(state_dict):
+    normalized = {}
+    stripped_count = 0
+    for name, tensor in state_dict.items():
+        clean_name = name.removeprefix("_orig_mod.")
+        if clean_name != name:
+            stripped_count += 1
+        if clean_name in normalized:
+            raise ValueError(f"Duplicate tensor name after removing _orig_mod. prefix: {clean_name}")
+        normalized[clean_name] = tensor
+    return normalized, stripped_count
 
 
 def should_quantize_tensor(name, tensor, method, quantize_embeddings):
@@ -162,13 +193,16 @@ def main():
 
     root_dir, source_name = resolve_checkpoint_root(args)
     checkpoint_dir, model_tag, step, model_data, meta_data = load_checkpoint_state(root_dir, args.model_tag, args.step)
+    model_data, stripped_orig_mod_keys = strip_orig_mod_prefix(model_data)
+    effective_quantize_embeddings = args.quantize_embeddings or args.method in {"int8_sym", "fp16_copy"}
 
     export_tensors, tensor_meta, stats = export_quantized_state(
         torch=torch,
         state_dict=model_data,
         method=args.method,
-        quantize_embeddings=bool(args.quantize_embeddings),
+        quantize_embeddings=effective_quantize_embeddings,
     )
+    stats["stripped_orig_mod_keys"] = stripped_orig_mod_keys
 
     if args.output_dir is None:
         from nanochat.common import get_base_dir
@@ -191,8 +225,10 @@ def main():
             "source_step": step,
             "source_family": source_name,
             "quant_method": args.method,
-            "quantize_embeddings": bool(args.quantize_embeddings),
+            "quantize_embeddings": effective_quantize_embeddings,
+            "requested_quantize_embeddings": args.quantize_embeddings,
             "model_config": meta_data.get("model_config"),
+            "artifact_format_version": 2,
         },
         artifact_path,
     )
@@ -203,9 +239,11 @@ def main():
         "source_step": step,
         "source_family": source_name,
         "quant_method": args.method,
-        "quantize_embeddings": bool(args.quantize_embeddings),
+        "quantize_embeddings": effective_quantize_embeddings,
+        "requested_quantize_embeddings": args.quantize_embeddings,
         "stats": stats,
         "model_config": meta_data.get("model_config"),
+        "artifact_format_version": 2,
     }
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(export_meta, f, indent=2)

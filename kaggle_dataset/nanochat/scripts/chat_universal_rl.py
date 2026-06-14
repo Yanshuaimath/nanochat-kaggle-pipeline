@@ -1,19 +1,21 @@
 """
 Universal chat RL trainer for GSM8K.
 
-This is a standalone sibling of scripts/chat_rl.py that keeps the existing
-rollout/evaluation flow, but makes the optimization objective selectable.
+Runs post-SFT reinforcement learning from a saved chat checkpoint with a
+selectable objective. The trainer shares the GSM8K rollout/evaluation flow
+with scripts/chat_rl.py, but keeps the objective choice in one script for
+clean side-by-side experiments.
 
-Currently supported objectives:
-- reinforce : current nanochat-style grouped REINFORCE baseline
-- rloo_kl   : leave-one-out REINFORCE with optional sampled KL-to-reference
+Supported objectives:
+- reinforce : grouped REINFORCE with a per-prompt reward baseline
+- rloo_kl   : leave-one-out REINFORCE with optional sampled KL to a frozen reference
 - gspo      : sequence-level clipped policy optimization with RLOO advantages
 
 Examples:
 
-python -m scripts.chat_universal_rl --objective=reinforce
-python -m scripts.chat_universal_rl --objective=rloo_kl --kl-beta=0.02
-python -m scripts.chat_universal_rl --objective=gspo --update-epochs=4 --clip-epsilon=0.2
+python -m scripts.chat_universal_rl --objective=reinforce --top-k=0
+python -m scripts.chat_universal_rl --objective=rloo_kl --kl-beta=0.02 --top-k=0
+python -m scripts.chat_universal_rl --objective=gspo --update-epochs=2 --clip-epsilon=0.2 --top-k=0
 """
 
 import argparse
@@ -54,7 +56,7 @@ def parse_args():
     parser.add_argument("--reference-step", type=int, default=None, help="reference model step (defaults to model step)")
     # Objective
     parser.add_argument("--objective", type=str, default="reinforce", choices=["reinforce", "rloo_kl", "gspo"], help="policy optimization objective")
-    parser.add_argument("--kl-beta", type=float, default=0.0, help="sampled KL penalty coefficient")
+    parser.add_argument("--kl-beta", type=float, default=0.0, help="full-policy mean per-token sampled KL penalty coefficient")
     parser.add_argument("--clip-epsilon", type=float, default=0.2, help="clipping epsilon for GSPO")
     parser.add_argument("--update-epochs", type=int, default=1, help="number of optimization epochs per sampled rollout batch")
     parser.add_argument("--log-ratio-cap", type=float, default=20.0, help="clamp sequence log-ratio before exp for numerical stability")
@@ -111,19 +113,72 @@ def compute_token_logps(model, inputs, targets):
     return token_logps, valid
 
 
+def compute_sampling_token_logps(model, inputs, targets, temperature=1.0, top_k=0):
+    assert temperature > 0.0, "temperature must be positive for stochastic policy gradients"
+    valid = targets >= 0
+    safe_targets = targets.clamp(min=0)
+    logits = model(inputs) / temperature
+
+    if top_k is not None and top_k > 0:
+        k = min(top_k, logits.size(-1))
+        top_vals, top_idx = torch.topk(logits, k, dim=-1)
+        log_denom = torch.logsumexp(top_vals, dim=-1)
+        target_logits = logits.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1)
+        in_topk = (top_idx == safe_targets.unsqueeze(-1)).any(dim=-1)
+        token_logps = target_logits - log_denom
+        token_logps = token_logps.masked_fill(valid & ~in_topk, -torch.inf)
+    else:
+        logprobs = F.log_softmax(logits, dim=-1)
+        token_logps = logprobs.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1)
+
+    token_logps = token_logps.masked_fill(~valid, 0.0)
+    return token_logps, valid
+
+
 @torch.no_grad()
-def collect_token_logps(model, inputs_all, targets_all, batch_size):
+def collect_token_logps(model, inputs_all, targets_all, batch_size, temperature=1.0, top_k=0):
     token_chunks = []
     for b0 in range(0, inputs_all.size(0), batch_size):
         b1 = min(b0 + batch_size, inputs_all.size(0))
-        token_logps, _ = compute_token_logps(model, inputs_all[b0:b1], targets_all[b0:b1])
+        token_logps, _ = compute_sampling_token_logps(
+            model,
+            inputs_all[b0:b1],
+            targets_all[b0:b1],
+            temperature=temperature,
+            top_k=top_k,
+        )
         token_chunks.append(token_logps)
     return torch.cat(token_chunks, dim=0)
 
 
 def sampled_kl_per_sequence(token_logps, ref_token_logps, valid):
+    """Mean per-token sampled log-ratio for each rollout sequence."""
     lengths = valid.sum(dim=-1).clamp(min=1)
     return ((token_logps - ref_token_logps) * valid).sum(dim=-1) / lengths
+
+
+def strip_terminal_tokens(tokens, terminal_tokens):
+    if tokens and tokens[-1] in terminal_tokens:
+        return tokens[:-1]
+    return tokens
+
+
+def generate_batch_with_terminal(engine, tokens, num_samples=1, **kwargs):
+    assistant_end = engine.tokenizer.encode_special("<|assistant_end|>")
+    bos = engine.tokenizer.get_bos_token_id()
+    results = [tokens.copy() for _ in range(num_samples)]
+    masks = [[0] * len(tokens) for _ in range(num_samples)]
+    completed = [False] * num_samples
+    for token_column, token_masks in engine.generate(tokens, num_samples, **kwargs):
+        for i, (token, mask) in enumerate(zip(token_column, token_masks)):
+            if not completed[i]:
+                results[i].append(token)
+                masks[i].append(mask)
+                if token == assistant_end or token == bos:
+                    completed[i] = True
+        if all(completed):
+            break
+    return results, masks
 
 
 def compute_objective_loss(
@@ -132,8 +187,7 @@ def compute_objective_loss(
     valid,
     advantages,
     old_token_logps=None,
-    ref_token_logps=None,
-    kl_beta=0.0,
+    token_normalizer=None,
     clip_epsilon=0.2,
     log_ratio_cap=20.0,
 ):
@@ -144,24 +198,18 @@ def compute_objective_loss(
     if objective in {"reinforce", "rloo_kl"}:
         per_token_adv = advantages.unsqueeze(-1)
         pg_obj = (token_logps * per_token_adv * valid_f).sum()
-        pg_obj = pg_obj / lengths.sum().clamp(min=1)
+        normalizer = lengths.sum().clamp(min=1) if token_normalizer is None else token_normalizer
+        pg_obj = pg_obj / normalizer.to(token_logps.dtype)
         metrics["pg_obj"] = pg_obj.detach()
 
-        if ref_token_logps is not None and kl_beta > 0.0:
-            kl_seq = sampled_kl_per_sequence(token_logps, ref_token_logps, valid_f)
-            kl_term = kl_seq.mean()
-            metrics["sampled_kl"] = kl_term.detach()
-            loss = -pg_obj + kl_beta * kl_term
-        else:
-            metrics["sampled_kl"] = torch.zeros((), device=token_logps.device)
-            loss = -pg_obj
-
-        return loss, metrics
+        return -pg_obj, metrics
 
     if objective == "gspo":
         assert old_token_logps is not None, "GSPO requires frozen rollout logprobs"
-        seq_logp = (token_logps * valid_f).sum(dim=-1)
-        seq_logp_old = (old_token_logps * valid_f).sum(dim=-1)
+        # Length-normalized sequence ratio avoids clipping almost every long response
+        # after tiny per-token probability changes.
+        seq_logp = (token_logps * valid_f).sum(dim=-1) / lengths
+        seq_logp_old = (old_token_logps * valid_f).sum(dim=-1) / lengths
         log_ratio = torch.clamp(seq_logp - seq_logp_old, min=-log_ratio_cap, max=log_ratio_cap)
         ratio = torch.exp(log_ratio)
         clipped_ratio = ratio.clamp(1.0 - clip_epsilon, 1.0 + clip_epsilon)
@@ -175,14 +223,6 @@ def compute_objective_loss(
         metrics["ratio_max"] = ratio.max().detach()
         metrics["pg_obj"] = seq_obj.mean().detach()
 
-        if ref_token_logps is not None and kl_beta > 0.0:
-            kl_seq = sampled_kl_per_sequence(token_logps, ref_token_logps, valid_f)
-            kl_term = kl_seq.mean()
-            metrics["sampled_kl"] = kl_term.detach()
-            loss = loss + kl_beta * kl_term
-        else:
-            metrics["sampled_kl"] = torch.zeros((), device=token_logps.device)
-
         return loss, metrics
 
     raise ValueError(f"Unknown objective: {objective}")
@@ -195,6 +235,16 @@ def maybe_reduce_mean_scalar(value, ddp, device):
     return tensor.item()
 
 
+def global_token_normalizer(rollout_batches, ddp, ddp_world_size, device):
+    normalizer = torch.zeros((), dtype=torch.float, device=device)
+    for batch in rollout_batches:
+        normalizer = normalizer + (batch["targets_all"] >= 0).sum().to(dtype=torch.float)
+    if ddp:
+        dist.all_reduce(normalizer, op=dist.ReduceOp.SUM)
+        normalizer = normalizer / ddp_world_size
+    return normalizer.clamp(min=1.0)
+
+
 def main():
     args = parse_args()
     user_config = vars(args).copy()
@@ -202,9 +252,23 @@ def main():
     # YQ workaround: force float32 compute in this script to avoid CUDA generation dtype mismatch
     #os.environ["NANOCHAT_DTYPE"] = "float32"
 
+    assert args.device_batch_size > 0, "--device-batch-size must be positive"
+    assert args.examples_per_step > 0, "--examples-per-step must be positive"
+    assert args.num_samples > 0, "--num-samples must be positive"
+    assert args.eval_every > 0, "--eval-every must be positive"
+    assert args.save_every > 0, "--save-every must be positive"
+    assert args.kl_beta >= 0.0, "--kl-beta must be non-negative"
     assert args.num_samples % args.device_batch_size == 0, "num_samples must be divisible by device_batch_size"
+    assert args.temperature > 0.0, "--temperature must be positive for stochastic policy-gradient training"
     if args.objective == "gspo":
         assert args.update_epochs >= 1, "GSPO requires at least one update epoch"
+        assert args.top_k == 0, "GSPO ratios require full-support sampling; use --top-k=0"
+    else:
+        assert args.update_epochs == 1, "--update-epochs > 1 requires objective=gspo because REINFORCE/RLOO would be off-policy"
+    if args.kl_beta > 0.0:
+        assert abs(args.temperature - 1.0) < 1e-8 and args.top_k == 0, (
+            "--kl-beta estimates full-policy sampled KL, so it requires --temperature=1.0 --top-k=0"
+        )
 
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
@@ -221,6 +285,11 @@ def main():
     if need_reference:
         ref_tag = args.reference_tag if args.reference_tag is not None else args.model_tag
         ref_step = args.reference_step if args.reference_step is not None else args.model_step
+        if args.reference_tag is None and args.reference_source != args.model_source:
+            print0(
+                "Warning: --reference-tag was not set, so the reference will reuse --model-tag "
+                f"({args.model_tag}) under reference-source={args.reference_source}."
+            )
         ref_model, _, _ = load_model(args.reference_source, device, phase="eval", model_tag=ref_tag, step=ref_step)
         freeze_model(ref_model)
 
@@ -233,10 +302,13 @@ def main():
     print0(f"Calculated number of steps: {num_steps}")
 
     @torch.no_grad()
-    def get_batch(step):
+    def get_batch():
         assistant_end = tokenizer.encode_special("<|assistant_end|>")
+        bos = tokenizer.get_bos_token_id()
+        terminal_tokens = {assistant_end, bos}
         rank_indices = range(ddp_rank, len(train_task), ddp_world_size)
         rank_iter = itertools.cycle(rank_indices)
+        rollout_id = 0
         for example_idx in rank_iter:
             conversation = train_task[example_idx]
             tokens = tokenizer.render_for_completion(conversation)
@@ -247,8 +319,9 @@ def main():
             masks = []
             num_sampling_steps = args.num_samples // args.device_batch_size
             for sampling_step in range(num_sampling_steps):
-                seed = hash((step, example_idx, sampling_step)) & 0x7FFFFFFF
-                generated_batch, masks_batch = engine.generate_batch(
+                seed = hash((rollout_id, example_idx, sampling_step)) & 0x7FFFFFFF
+                generated_batch, masks_batch = generate_batch_with_terminal(
+                    engine,
                     tokens,
                     num_samples=args.device_batch_size,
                     max_tokens=args.max_new_tokens,
@@ -261,7 +334,7 @@ def main():
 
             rewards = []
             for sample_tokens in generated_token_sequences:
-                generated_tokens = sample_tokens[prefix_length:]
+                generated_tokens = strip_terminal_tokens(sample_tokens[prefix_length:], terminal_tokens)
                 generated_text = tokenizer.decode(generated_tokens)
                 rewards.append(train_task.reward(conversation, generated_text))
 
@@ -276,8 +349,8 @@ def main():
             targets[mask_ids[:, 1:] == 0] = -1
 
             rewards = torch.tensor(rewards, dtype=torch.float, device=device)
-            advantages = build_advantages(rewards, args.objective)
-            yield generated_token_sequences, inputs, targets, rewards, advantages
+            yield generated_token_sequences, inputs, targets, rewards
+            rollout_id += 1
 
     def run_gsm8k_eval(task, tokenizer, engine, max_examples=None, num_samples=1, max_completion_tokens=256, temperature=0.0, top_k=50):
         max_examples = min(max_examples, len(task)) if max_examples is not None else len(task)
@@ -318,9 +391,8 @@ def main():
     examples_per_rank = args.examples_per_step // ddp_world_size
     print0(f"Calculated examples per rank: {examples_per_rank}")
 
+    batch_iterator = get_batch()
     for step in range(num_steps):
-        batch_iterator = get_batch(step)
-
         if step % args.eval_every == 0:
             model.eval()
             passk = torch.zeros(args.device_batch_size, device=device)
@@ -345,6 +417,7 @@ def main():
             wandb_run.log({"step": step, **{f"pass@{k}": passk[k - 1].item() for k in range(1, args.device_batch_size + 1)}})
 
         rewards_list = []
+        returns_list = []
         sequence_lengths = []
         loss_values = []
         kl_values = []
@@ -352,11 +425,29 @@ def main():
         rollout_batches = []
 
         for example_step in range(examples_per_rank):
-            sequences_all, inputs_all, targets_all, rewards_all, advantages_all = next(batch_iterator)
-            old_token_logps_all = collect_token_logps(model, inputs_all, targets_all, args.device_batch_size)
-            ref_token_logps_all = None
+            sequences_all, inputs_all, targets_all, rewards_all = next(batch_iterator)
+            old_token_logps_all = collect_token_logps(
+                model,
+                inputs_all,
+                targets_all,
+                args.device_batch_size,
+                temperature=args.temperature,
+                top_k=args.top_k,
+            )
+            rollout_kl_all = torch.zeros_like(rewards_all)
             if ref_model is not None:
-                ref_token_logps_all = collect_token_logps(ref_model, inputs_all, targets_all, args.device_batch_size)
+                old_kl_token_logps_all = old_token_logps_all
+                ref_token_logps_all = collect_token_logps(
+                    ref_model,
+                    inputs_all,
+                    targets_all,
+                    args.device_batch_size,
+                    temperature=1.0,
+                    top_k=0,
+                )
+                rollout_kl_all = sampled_kl_per_sequence(old_kl_token_logps_all, ref_token_logps_all, targets_all >= 0)
+            returns_all = rewards_all - args.kl_beta * rollout_kl_all
+            advantages_all = build_advantages(returns_all, args.objective)
 
             rollout_batches.append(
                 {
@@ -365,13 +456,23 @@ def main():
                     "inputs_all": inputs_all,
                     "targets_all": targets_all,
                     "rewards_all": rewards_all,
+                    "returns_all": returns_all,
                     "advantages_all": advantages_all,
                     "old_token_logps_all": old_token_logps_all,
-                    "ref_token_logps_all": ref_token_logps_all,
+                    "rollout_kl_all": rollout_kl_all,
                 }
             )
             rewards_list.append(rewards_all.mean().item())
+            returns_list.append(returns_all.mean().item())
             sequence_lengths.extend(len(seq) for seq in sequences_all)
+
+        token_normalizer = None
+        if args.objective in {"reinforce", "rloo_kl"}:
+            token_normalizer = global_token_normalizer(rollout_batches, ddp, ddp_world_size, device)
+        total_microbatches = 0
+        for batch in rollout_batches:
+            assert batch["inputs_all"].size(0) % args.device_batch_size == 0
+            total_microbatches += batch["inputs_all"].size(0) // args.device_batch_size
 
         lrm = get_lr_multiplier(step)
         for group in optimizer.param_groups:
@@ -385,8 +486,10 @@ def main():
                 targets_all = batch["targets_all"]
                 advantages_all = batch["advantages_all"]
                 old_token_logps_all = batch["old_token_logps_all"]
-                ref_token_logps_all = batch["ref_token_logps_all"]
+                rollout_kl_all = batch["rollout_kl_all"]
                 rewards_all = batch["rewards_all"]
+                returns_all = batch["returns_all"]
+                num_passes = inputs_all.size(0) // args.device_batch_size
 
                 for b0 in range(0, inputs_all.size(0), args.device_batch_size):
                     b1 = min(b0 + args.device_batch_size, inputs_all.size(0))
@@ -394,42 +497,56 @@ def main():
                     targets = targets_all[b0:b1]
                     advantages = advantages_all[b0:b1]
                     old_token_logps = old_token_logps_all[b0:b1]
-                    ref_token_logps = None if ref_token_logps_all is None else ref_token_logps_all[b0:b1]
+                    rollout_kl = rollout_kl_all[b0:b1]
 
-                    token_logps, valid = compute_token_logps(model, inputs, targets)
+                    token_logps, valid = compute_sampling_token_logps(
+                        model,
+                        inputs,
+                        targets,
+                        temperature=args.temperature,
+                        top_k=args.top_k,
+                    )
                     loss, metrics = compute_objective_loss(
                         objective=args.objective,
                         token_logps=token_logps,
                         valid=valid,
                         advantages=advantages,
                         old_token_logps=old_token_logps,
-                        ref_token_logps=ref_token_logps,
-                        kl_beta=args.kl_beta,
+                        token_normalizer=token_normalizer,
                         clip_epsilon=args.clip_epsilon,
                         log_ratio_cap=args.log_ratio_cap,
                     )
-                    loss = loss / examples_per_rank
+                    raw_loss = loss
+                    if args.objective == "gspo":
+                        loss = loss / total_microbatches
                     loss.backward()
 
-                    loss_values.append(loss.detach().item())
-                    kl_values.append(metrics["sampled_kl"].item())
+                    loss_values.append(raw_loss.detach().item())
+                    kl_values.append(rollout_kl.mean().item())
                     if "ratio_mean" in metrics:
                         ratio_values.append(metrics["ratio_mean"].item())
 
+                    loss_name = "loss" if args.objective == "gspo" else "loss_contrib"
                     print0(
                         f"Step {step}/{num_steps} | Example {batch['example_step']} | Epoch {update_epoch} | "
-                        f"loss: {loss.item():.6f} | reward: {rewards_all.mean().item():.4f}"
+                        f"{loss_name}: {raw_loss.item():.6f} | reward: {rewards_all.mean().item():.4f} | "
+                        f"return: {returns_all.mean().item():.4f}"
                     )
 
             optimizer.step()
 
         mean_reward = sum(rewards_list) / len(rewards_list)
+        mean_return = sum(returns_list) / len(returns_list)
         mean_sequence_length = sum(sequence_lengths) / len(sequence_lengths)
-        mean_loss = sum(loss_values) / len(loss_values) if loss_values else 0.0
+        if args.objective in {"reinforce", "rloo_kl"}:
+            mean_loss = sum(loss_values) if loss_values else 0.0
+        else:
+            mean_loss = sum(loss_values) / len(loss_values) if loss_values else 0.0
         mean_kl = sum(kl_values) / len(kl_values) if kl_values else 0.0
         mean_ratio = sum(ratio_values) / len(ratio_values) if ratio_values else 1.0
 
         mean_reward = maybe_reduce_mean_scalar(mean_reward, ddp, device)
+        mean_return = maybe_reduce_mean_scalar(mean_return, ddp, device)
         mean_sequence_length = maybe_reduce_mean_scalar(mean_sequence_length, ddp, device)
         mean_loss = maybe_reduce_mean_scalar(mean_loss, ddp, device)
         mean_kl = maybe_reduce_mean_scalar(mean_kl, ddp, device)
@@ -437,13 +554,14 @@ def main():
 
         print0(
             f"Step {step}/{num_steps} | objective={args.objective} | "
-            f"reward: {mean_reward:.4f} | seq_len: {mean_sequence_length:.2f} | "
+            f"reward: {mean_reward:.4f} | return: {mean_return:.4f} | seq_len: {mean_sequence_length:.2f} | "
             f"loss: {mean_loss:.6f} | sampled_kl: {mean_kl:.6f} | ratio: {mean_ratio:.4f}"
         )
         wandb_run.log(
             {
                 "step": step,
                 "reward": mean_reward,
+                "return": mean_return,
                 "sequence_length": mean_sequence_length,
                 "loss": mean_loss,
                 "sampled_kl": mean_kl,

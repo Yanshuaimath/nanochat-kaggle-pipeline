@@ -9,7 +9,7 @@ Supported input sources:
 - jsonl : prompts/messages from a JSONL file
 
 Supported output formats:
-- sft        : JSONL lines compatible with tasks.customjson.CustomJSON
+- sft        : JSONL lines compatible with scripts.chat_distill.DistillJSON
 - preference : JSONL with prompt/chosen/rejected triples, suitable for chat_dpo.py/chat_ppo.py
 
 Examples:
@@ -19,6 +19,7 @@ python3 -m scripts.chat_distill_data --input-source=jsonl --input-path=prompts.j
 """
 
 import argparse
+import copy
 import json
 import os
 import random
@@ -64,7 +65,64 @@ def require_transformers():
 def flatten_assistant_content(content):
     if isinstance(content, str):
         return content
-    return "".join(part["text"] for part in content)
+    text_parts = []
+    for part in content:
+        if isinstance(part, str):
+            text_parts.append(part)
+        elif isinstance(part, dict) and "text" in part:
+            text_parts.append(part["text"])
+    return "".join(text_parts)
+
+
+def normalize_messages(messages):
+    assert isinstance(messages, list), f"Expected messages to be a list, got {type(messages)}"
+    normalized = []
+    for i, message in enumerate(messages):
+        assert isinstance(message, dict), f"Message {i} must be an object"
+        assert "role" in message and "content" in message, f"Message {i} missing role/content"
+        normalized.append(
+            {
+                "role": message["role"],
+                "content": flatten_assistant_content(message["content"]),
+            }
+        )
+    return normalized
+
+
+def last_user_content(messages):
+    for message in reversed(messages):
+        if message["role"] == "user":
+            return message["content"]
+    return None
+
+
+def prepare_generation_messages(messages):
+    messages = copy.deepcopy(normalize_messages(messages))
+    while messages and messages[-1]["role"] == "assistant":
+        messages.pop()
+    if not messages:
+        raise ValueError("No prompt messages remain after removing trailing assistant messages")
+    assert messages[-1]["role"] == "user", "Teacher generation context must end with a user message"
+
+    start = 1 if messages[0]["role"] == "system" else 0
+    for i, message in enumerate(messages[start:]):
+        expected_role = "user" if i % 2 == 0 else "assistant"
+        assert message["role"] == expected_role, (
+            f"Message {start + i} has role {message['role']} but should be {expected_role}"
+        )
+    return messages
+
+
+def messages_to_prompt_text(messages):
+    if len(messages) == 1 and messages[0]["role"] == "user":
+        return messages[0]["content"]
+    if (
+        len(messages) == 2
+        and messages[0]["role"] == "system"
+        and messages[1]["role"] == "user"
+    ):
+        return messages[0]["content"] + "\n\n" + messages[1]["content"]
+    return "\n".join(f"{message['role']}: {message['content']}" for message in messages)
 
 
 def load_prompts_from_gsm8k(args):
@@ -78,7 +136,14 @@ def load_prompts_from_gsm8k(args):
     for i in range(args.start, stop):
         conversation = task[i]
         prompt = conversation["messages"][0]["content"]
-        examples.append({"prompt": prompt, "conversation": conversation, "source_index": i})
+        examples.append(
+            {
+                "prompt": prompt,
+                "messages": [{"role": "user", "content": prompt}],
+                "conversation": conversation,
+                "source_index": i,
+            }
+        )
     return examples
 
 
@@ -97,13 +162,19 @@ def load_prompts_from_jsonl(args):
                 continue
             row = json.loads(line)
             if isinstance(row, list):
-                messages = row
-                prompt = next((m["content"] for m in messages if m["role"] == "user"), None)
+                messages = prepare_generation_messages(row)
+                prompt = last_user_content(messages)
             else:
-                messages = row.get("messages")
+                raw_messages = row.get("messages")
                 prompt = row.get("prompt")
-                if prompt is None and messages is not None:
-                    prompt = next((m["content"] for m in messages if m["role"] == "user"), None)
+                if raw_messages is not None:
+                    messages = prepare_generation_messages(raw_messages)
+                    if prompt is None:
+                        prompt = last_user_content(messages)
+                else:
+                    if prompt is None:
+                        raise ValueError(f"Could not find prompt in row {idx}")
+                    messages = [{"role": "user", "content": prompt}]
             if prompt is None:
                 raise ValueError(f"Could not find prompt in row {idx}")
             examples.append({"prompt": prompt, "messages": messages, "source_index": idx})
@@ -116,19 +187,27 @@ def load_examples(args):
     return load_prompts_from_jsonl(args)
 
 
-def build_teacher_messages(prompt, args):
+def build_teacher_messages(example, args):
+    messages = copy.deepcopy(example["messages"])
+    if args.system_prompt:
+        if messages[0]["role"] == "system":
+            if messages[0]["content"].strip() == args.system_prompt.strip():
+                pass
+            elif messages[0]["content"].strip():
+                messages[0]["content"] = args.system_prompt + "\n\n" + messages[0]["content"]
+            else:
+                messages[0]["content"] = args.system_prompt
+        else:
+            messages.insert(0, {"role": "system", "content": args.system_prompt})
+
     if args.chat_style == "solution":
-        user_prompt = (
+        solution_prompt = (
             "Solve the following problem carefully. Show a concise reasoning process and finish "
             "with a final answer on a new line in the form '#### answer'.\n\n"
-            f"{prompt}"
+            f"{messages[-1]['content']}"
         )
-    else:
-        user_prompt = prompt
-    return [
-        {"role": "system", "content": args.system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
+        messages[-1]["content"] = solution_prompt
+    return messages
 
 
 def load_teacher(args):
@@ -150,6 +229,7 @@ def load_teacher(args):
     model = AutoModelForCausalLM.from_pretrained(args.teacher_model, **model_kwargs)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    model.eval()
     return torch, tokenizer, model
 
 
@@ -165,15 +245,16 @@ def generate_text(torch, tokenizer, model, messages, args, seed_offset=0):
         else:
             torch.manual_seed(args.seed + seed_offset)
     with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            do_sample=args.temperature > 0,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            max_new_tokens=args.max_new_tokens,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
+        generate_kwargs = {
+            "do_sample": args.temperature > 0,
+            "max_new_tokens": args.max_new_tokens,
+            "pad_token_id": tokenizer.pad_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+        }
+        if args.temperature > 0:
+            generate_kwargs["temperature"] = args.temperature
+            generate_kwargs["top_p"] = args.top_p
+        outputs = model.generate(**inputs, **generate_kwargs)
     new_tokens = outputs[0, inputs["input_ids"].size(1):]
     text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
     return text
@@ -186,9 +267,6 @@ def synthesize_rejected(answer_text):
         extract_answer = None
     gold = extract_answer(answer_text) if extract_answer is not None else None
     if gold is None:
-        truncated = answer_text.splitlines()
-        if len(truncated) > 1:
-            return truncated[0].strip()
         return "I am not sure."
     try:
         if "." in gold:
@@ -200,21 +278,45 @@ def synthesize_rejected(answer_text):
     return f"I think the answer is {wrong}.\n#### {wrong}"
 
 
-def write_sft_line(f, prompt, answer_text):
-    row = [
-        {"role": "user", "content": prompt},
-        {"role": "assistant", "content": answer_text},
-    ]
+def extract_gsm_answer(answer_text):
+    try:
+        from tasks.gsm8k import extract_answer
+    except ModuleNotFoundError:
+        return None
+    return extract_answer(answer_text)
+
+
+def should_fallback_rejected(chosen, rejected):
+    if rejected.strip() == chosen.strip():
+        return True
+    chosen_gold = extract_gsm_answer(chosen)
+    rejected_gold = extract_gsm_answer(rejected)
+    return chosen_gold is not None and chosen_gold == rejected_gold
+
+
+def write_sft_line(f, messages, answer_text):
+    row = copy.deepcopy(messages)
+    row.append({"role": "assistant", "content": answer_text})
     f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def write_preference_line(f, prompt, chosen, rejected):
-    row = {"prompt": prompt, "chosen": chosen, "rejected": rejected}
+def write_preference_line(f, messages, chosen, rejected):
+    row = {
+        "prompt": messages_to_prompt_text(messages),
+        "messages": copy.deepcopy(messages),
+        "chosen": chosen,
+        "rejected": rejected,
+    }
     f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def main():
     args = parse_args()
+    assert args.max_examples >= 0, "--max-examples must be non-negative"
+    assert args.start >= 0, "--start must be non-negative"
+    assert args.temperature >= 0.0, "--temperature must be non-negative"
+    assert 0.0 < args.top_p <= 1.0, "--top-p must be in (0, 1]"
+    assert args.max_new_tokens > 0, "--max-new-tokens must be positive"
     os.makedirs(os.path.dirname(os.path.abspath(os.path.expanduser(args.output_path))), exist_ok=True)
     random.seed(args.seed)
 
@@ -226,20 +328,19 @@ def main():
     output_path = os.path.expanduser(args.output_path)
     with open(output_path, "w", encoding="utf-8") as f:
         for idx, example in enumerate(examples):
-            prompt = example["prompt"]
-            messages = build_teacher_messages(prompt, args)
+            messages = build_teacher_messages(example, args)
             chosen = generate_text(torch, tokenizer, model, messages, args, seed_offset=2 * idx)
 
             if args.output_format == "sft":
-                write_sft_line(f, prompt, chosen)
+                write_sft_line(f, messages, chosen)
             else:
                 if args.rejected_style == "resample":
                     rejected = generate_text(torch, tokenizer, model, messages, args, seed_offset=2 * idx + 1)
-                    if rejected.strip() == chosen.strip():
+                    if should_fallback_rejected(chosen, rejected):
                         rejected = synthesize_rejected(chosen)
                 else:
                     rejected = synthesize_rejected(chosen)
-                write_preference_line(f, prompt, chosen, rejected)
+                write_preference_line(f, messages, chosen, rejected)
 
             if (idx + 1) % 10 == 0 or idx == len(examples) - 1:
                 print(f"Wrote {idx + 1}/{len(examples)} examples to {output_path}")

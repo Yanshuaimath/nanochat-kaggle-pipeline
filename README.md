@@ -1,49 +1,58 @@
 # Nanochat Kaggle Pipeline
 
-This repository packages a Kaggle-ready, end-to-end `nanochat` pipeline.
+This repository contains a Kaggle-ready training and post-training pipeline for
+[`nanochat`](https://github.com/karpathy/nanochat). It packages the modified
+nanochat source code as a Kaggle Dataset and provides notebook stages that can be
+run on Kaggle, mostly targeting the `2x Tesla T4` GPU runtime.
 
-The project is built around two artifacts:
+The goal is practical pipeline validation on Kaggle: pretraining, SFT,
+distillation, preference optimization, RL post-training, quantization, and
+serving tests.
 
-- [nanochat-run.ipynb](./nanochat-run.ipynb), the notebook you run on Kaggle
-- [kaggle_dataset/](./kaggle_dataset), the local Kaggle dataset package included in this repo
+## Main D8 Notebook Order
 
-The goal is pipeline validation, not training a strong final model. The notebook is intentionally small enough to exercise the full code path on Kaggle with `2x Tesla T4` GPUs.
+Run the `d8` pipeline in this order:
 
-## Acknowledgement
+1. [`nanochat_d8_pretraining.ipynb`](./nanochat_d8_pretraining.ipynb)
+2. [`nanochat_d8_sft.ipynb`](./nanochat_d8_sft.ipynb)
+3. [`nanochat_d8_distill.ipynb`](./nanochat_d8_distill.ipynb)
+4. [`nanochat_d8_rl_and_dpo.ipynb`](./nanochat_d8_rl_and_dpo.ipynb)
+5. [`nanochat_d8_grpo.ipynb`](./nanochat_d8_grpo.ipynb)
+6. [`nanochat_d8_ppo_and_ppo-standard.ipynb`](./nanochat_d8_ppo_and_ppo-standard.ipynb)
+7. [`nanochat_d8_universal-rl.ipynb`](./nanochat_d8_universal-rl.ipynb)
+8. [`nanochat_d8_quant.ipynb`](./nanochat_d8_quant.ipynb)
 
-This repository builds on [karpathy/nanochat](https://github.com/karpathy/nanochat) and extends it with a Kaggle-oriented workflow, including dataset packaging, notebook execution, compact end-to-end validation, post-training branches, quantization, and serving entrypoints.
+The first two notebooks form the required base path:
 
-## What The Notebook Actually Does
+- pretraining produces the tokenizer and `base:d8_kaggle` checkpoint cache
+- SFT imports that pretraining cache and produces `sft:d8_kaggle`
 
-The notebook is the source of truth for this repo. It runs the following stages:
+The later notebooks start from the SFT cache and can be run independently after
+SFT has been saved as a Kaggle Dataset.
 
-1. verify the mounted Kaggle dataset and copy it into `/kaggle/working/nanochat`
-2. configure caches under `/kaggle/working/nanochat_cache` and `/kaggle/working/huggingface_cache`
-3. prompt for a Hugging Face token
-4. install the Python dependencies needed in the Kaggle runtime
-5. download a small pretraining slice with `python -m nanochat.dataset -n 8`
-6. train and evaluate the tokenizer
-7. pretrain a small `d8` base model
-8. evaluate the base model on reduced Kaggle-friendly settings
-9. download identity conversations and run chat SFT
-10. evaluate the SFT chat model
-11. install distillation extras and generate tiny teacher datasets
-12. run a small distillation branch
-13. generate preference data and run a tiny DPO branch
-14. compare SFT, distill, and DPO outputs
-15. quantize the distilled checkpoint and run a tiny AWQ smoke test
-16. evaluate the quantized artifact
-17. run tiny RL smoke tests for `chat_rl.py`, `chat_universal_rl.py`, and `chat_ppo.py`
-18. print serving commands for full-precision and quantized web apps
+## Other Notebooks
 
-The last two serving cells are intentionally non-blocking examples. They print the commands but do not launch the web servers automatically.
+Additional training notebooks are included:
 
-## Repo Layout
+- [`d12_pretraining/nanochat-d12_pretraining.ipynb`](./d12_pretraining/nanochat-d12_pretraining.ipynb):
+  real `d12` pretraining path. See the dedicated d12 section below for the
+  two-part training flow.
+
+## Repository Layout
 
 ```text
 .
 ├── README.md
-├── nanochat-run.ipynb
+├── kernel-metadata.json
+├── nanochat_d8_pretraining.ipynb
+├── nanochat_d8_sft.ipynb
+├── nanochat_d8_distill.ipynb
+├── nanochat_d8_rl_and_dpo.ipynb
+├── nanochat_d8_grpo.ipynb
+├── nanochat_d8_ppo_and_ppo-standard.ipynb
+├── nanochat_d8_universal-rl.ipynb
+├── nanochat_d8_quant.ipynb
+├── d12_pretraining/
 └── kaggle_dataset/
     ├── dataset-metadata.json
     └── nanochat/
@@ -54,124 +63,127 @@ The last two serving cells are intentionally non-blocking examples. They print t
         └── tests/
 ```
 
-One slightly unusual detail: the uploadable Kaggle dataset package is `kaggle_dataset/`, but the actual code lives inside `kaggle_dataset/nanochat/`. After publishing, Kaggle mounts that dataset as a folder named `nanochat-codes`, and the notebook copies that mounted content into `/kaggle/working/nanochat`.
+The uploadable Kaggle Dataset package is [`kaggle_dataset/`](./kaggle_dataset).
+The actual nanochat code lives inside
+[`kaggle_dataset/nanochat/`](./kaggle_dataset/nanochat). After publishing, Kaggle
+mounts that package as `nanochat-codes`, and the notebooks copy it into
+`/kaggle/working/nanochat`.
 
-## Dataset Setup
+## Kaggle Dataset Setup
 
-Before running the notebook, configure Kaggle with:
+All notebooks expect:
 
 - GPU enabled
 - internet enabled
-- your uploaded `nanochat-codes` dataset attached
+- the `nanochat-codes` Kaggle Dataset attached
 
-The dataset mapping is:
+Most post-pretraining notebooks also expect one or more cache datasets created by
+earlier stages.
 
-- local packaging directory in this repo: `kaggle_dataset/`
-- code inside that package: `kaggle_dataset/nanochat/`
-- Kaggle dataset name: `nanochat-codes`
-- mounted Kaggle path pattern: `/kaggle/input/datasets/<your-kaggle-username>/nanochat-codes`
+The code dataset mapping is:
 
-The notebook auto-detects the attached dataset from this mounted path pattern:
+- local package directory: `kaggle_dataset/`
+- code inside the package: `kaggle_dataset/nanochat/`
+- Kaggle dataset slug: `nanochat-codes`
+- mounted Kaggle path pattern:
+  `/kaggle/input/datasets/<your-kaggle-username>/nanochat-codes`
 
-```python
-/kaggle/input/datasets/<your-kaggle-username>/nanochat-codes
-```
-
-For example, with the author's Kaggle account:
-
-```python
-/kaggle/input/datasets/yshuaiqin/nanochat-codes
-```
-
-In this repository, the mounted Kaggle dataset `nanochat-codes` is expected to contain the same project files that live under [`kaggle_dataset/nanochat/`](./kaggle_dataset/nanochat).
-
-Early in the notebook, you will also be prompted for `HF_TOKEN`.
-
-## How To Publish The Dataset Bundle
-
-This repo includes Kaggle dataset metadata at [kaggle_dataset/dataset-metadata.json](./kaggle_dataset/dataset-metadata.json).
-
-For the author's Kaggle account, the dataset id is:
+For the author's Kaggle account, the code dataset id is:
 
 ```text
 yshuaiqin/nanochat-codes
 ```
 
-If you publish under your own Kaggle account, the dataset id becomes:
+Each notebook auto-detects attached datasets from Kaggle input paths and copies
+the required code/cache files into `/kaggle/working`.
 
-```text
-<your-kaggle-username>/nanochat-codes
-```
+## Publishing The Code Dataset
 
-Typical update flow:
+The Kaggle metadata for the code bundle is stored at
+[`kaggle_dataset/dataset-metadata.json`](./kaggle_dataset/dataset-metadata.json).
+
+Publish or update the code dataset with:
 
 ```bash
 kaggle datasets version -p kaggle_dataset -m "update nanochat Kaggle dataset" --dir-mode zip
 ```
 
-This command publishes the local packaging directory `kaggle_dataset/`. After publishing, attach the resulting Kaggle dataset `nanochat-codes` to the notebook. The notebook then reads the mounted dataset from `/kaggle/input/datasets/<your-kaggle-username>/nanochat-codes`.
+If publishing under a different Kaggle account, update the dataset id in
+`kaggle_dataset/dataset-metadata.json` first.
 
-Then push the notebook separately as a Kaggle kernel that depends on that dataset.
+After publishing, attach `nanochat-codes` to each Kaggle notebook.
 
-## Key Runtime Choices In The Notebook
+## Stage Outputs
 
-The notebook makes a few environment assumptions explicitly:
+The notebooks pass work forward through Kaggle Dataset cache bundles:
 
-- `NANOCHAT_DTYPE=float16` for Tesla T4 compatibility
-- `torchrun --nproc_per_node=2` for Kaggle's 2 GPUs
-- short iteration counts and reduced eval sizes to keep the run practical
-- `--run=dummy` in training stages so the notebook does not require a Weights & Biases login
+| Stage | Notebook | Main output |
+| --- | --- | --- |
+| Pretraining | `nanochat_d8_pretraining.ipynb` | tokenizer and `base_checkpoints/d8_kaggle` |
+| SFT | `nanochat_d8_sft.ipynb` | `chatsft_checkpoints/d8_kaggle` |
+| Distill | `nanochat_d8_distill.ipynb` | `chatdistill_checkpoints/d8_kaggle` |
+| RL + DPO | `nanochat_d8_rl_and_dpo.ipynb` | RL and DPO checkpoint caches |
+| GRPO | `nanochat_d8_grpo.ipynb` | GRPO policy and reward checkpoints |
+| PPO | `nanochat_d8_ppo_and_ppo-standard.ipynb` | PPO and PPO-standard checkpoints |
+| Universal RL | `nanochat_d8_universal-rl.ipynb` | REINFORCE, RLOO-KL, and GSPO checkpoints |
+| Quant | `nanochat_d8_quant.ipynb` | `chatquant_exports` artifacts |
 
-The base-model stage uses a small `d8` configuration with conservative settings such as:
+The exact Kaggle Dataset ids for saved caches are set inside the notebook cells.
+Change them before uploading if you are publishing under your own account.
 
-```text
---depth=8
---device-batch-size=2
---max-seq-len=1024
---num-iterations=50
-```
+## D12 Pretraining Notebook
 
-The chat SFT stage uses:
+[`d12_pretraining/nanochat-d12_pretraining.ipynb`](./d12_pretraining/nanochat-d12_pretraining.ipynb)
+is a separate `d12` pretraining experiment. It downloads a moderate ClimbMix
+pretraining slice, trains/evaluates the tokenizer, pretrains a `d12` base model,
+saves `base_checkpoints/d12_kaggle`, and evaluates the base checkpoint with
+reduced Kaggle-friendly settings.
 
-```text
---device-batch-size=2
---total-batch-size=4096
---num-iterations=20
---mmlu-epochs=1
---gsm8k-epochs=1
-```
+Because the full `d12` pretraining run is too long for the expected T4 runtime,
+the notebook is designed as two half-runs:
 
-That `--total-batch-size=4096` choice is important in this notebook because it gives the intended effective step count under gradient accumulation.
+- first half: set `PRETRAIN_RUN_MODE = "first_half"` in the `D12 Run Settings`
+  cell, then publish the resulting cache as `nanochat-d12-pretrain-cache-first-half`
+- second half: attach `nanochat-d12-pretrain-cache-first-half`, keep
+  `CACHE_DATASET_NAME = "nanochat-d12-pretrain-cache-first-half"` in the first
+  code cell, and set `PRETRAIN_RUN_MODE = "second_half"` in `D12 Run Settings`
 
-## Kaggle-Specific SFT Fix
+## Runtime Choices
 
-The notebook does not use the default SFT entrypoint. It uses [kaggle_dataset/nanochat/scripts/chat_sft_updated.py](./kaggle_dataset/nanochat/scripts/chat_sft_updated.py) instead.
+The notebooks are tuned for Kaggle reliability rather than maximum throughput:
 
-This variant adds a single-rank warmup for Hugging Face-backed SFT datasets before distributed workers begin loading them. In notebook environments like Kaggle, that reduces failures caused by multiple workers trying to create caches or download data at the same time.
+- `torchrun --nproc_per_node=2` when both T4 GPUs are available
+- short training/evaluation runs for quick validation
+- `--run=dummy` so Weights & Biases login is not required
+- compile disabled in several post-training notebooks for Kaggle stability
+- `NANOCHAT_DTYPE=float16` for most training runs and `float32` where the script
+  is more stable without GradScaler
 
 ## What This Repo Validates
 
-This repository is best understood as a small-scale systems check for the full training and post-training pipeline.
-
-Validated by the notebook:
+This repository validates the Kaggle execution path for:
 
 - tokenizer training and evaluation
-- base-model train and eval flow
-- chat SFT and chat eval flow
+- `d8` base pretraining and evaluation
+- SFT from a saved base checkpoint
 - distillation data generation and student training
-- preference data generation and DPO flow
-- post-training comparison reports
-- quantization and quantized evaluation
-- RL code-path smoke tests
-- serving entrypoints for full-precision and quantized models
+- DPO and RL-style post-training
+- GRPO, PPO, and PPO-standard experiments
+- checkpoint comparison reports
+- optional quantized export/evaluation
+- full-precision and quantized serving entrypoints
 
-Not claimed by this repo:
+It does not claim:
 
 - strong benchmark performance
 - large-scale training quality
 - production-ready checkpoints
-- quality conclusions from the tiny Kaggle-scale post-training runs
+- reliable model-quality conclusions from the Kaggle-scale runs
 
-## If You Want To Inspect Or Modify The Pipeline
+## Acknowledgement
 
-Start with [nanochat-run.ipynb](./nanochat-run.ipynb). It already contains the exact commands, paths, and reduced settings used for the Kaggle validation run, so it is the best place to adjust batch sizes, iteration counts, model tags, or which stages you want to keep.
+This repository builds on
+[`karpathy/nanochat`](https://github.com/karpathy/nanochat). The changes here are
+focused on making nanochat runnable as a staged Kaggle workflow with dataset
+packaging, cache handoff, post-training branches, quantization, and serving
+entrypoints.

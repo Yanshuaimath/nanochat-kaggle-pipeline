@@ -30,6 +30,17 @@ from nanochat.tokenizer import get_tokenizer
 from tasks.gsm8k import GSM8K
 
 
+def parse_bool_arg(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in {"1", "true", "yes", "y"}:
+        return True
+    if value in {"0", "false", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError("expected a boolean value: 0/1, true/false, yes/no")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="AWQ-style INT4 exporter for nanochat")
     parser.add_argument("--source", type=str, default=None, choices=["base", "sft", "rl"])
@@ -40,10 +51,26 @@ def parse_args():
     parser.add_argument("--calibration-examples", type=int, default=128)
     parser.add_argument("--max-calibration-tokens", type=int, default=512)
     parser.add_argument("--alpha", type=float, default=0.5, help="Blend exponent for activation-aware scaling")
-    parser.add_argument("--quantize-embeddings", type=int, default=0)
+    parser.add_argument(
+        "--quantize-embeddings",
+        nargs="?",
+        const=True,
+        default=False,
+        type=parse_bool_arg,
+        help="Unsupported for AWQ; embeddings do not have linear input-channel calibration stats",
+    )
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--suffix", type=str, default="")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.calibration_examples <= 0:
+        parser.error("--calibration-examples must be positive")
+    if args.max_calibration_tokens <= 0:
+        parser.error("--max-calibration-tokens must be positive")
+    if not math.isfinite(args.alpha) or not (0.0 <= args.alpha <= 1.0):
+        parser.error("--alpha must be a finite value in [0.0, 1.0]")
+    if args.quantize_embeddings:
+        parser.error("--quantize-embeddings is not supported by the AWQ exporter")
+    return args
 
 
 def resolve_checkpoint_root(args):
@@ -69,13 +96,26 @@ def load_state(root_dir, model_tag, step):
     return checkpoint_dir, model_tag, step, model_data, meta_data
 
 
+def strip_orig_mod_prefix(state_dict):
+    normalized = {}
+    stripped_count = 0
+    for name, tensor in state_dict.items():
+        clean_name = name.removeprefix("_orig_mod.")
+        if clean_name != name:
+            stripped_count += 1
+        if clean_name in normalized:
+            raise ValueError(f"Duplicate tensor name after removing _orig_mod. prefix: {clean_name}")
+        normalized[clean_name] = tensor
+    return normalized, stripped_count
+
+
 def build_model_for_calibration(model_data, meta_data):
     from nanochat.checkpoint_manager import _patch_missing_config_keys, _patch_missing_keys
 
     model_config_kwargs = dict(meta_data["model_config"])
     _patch_missing_config_keys(model_config_kwargs)
     model_config = GPTConfig(**model_config_kwargs)
-    model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
+    model_data, _ = strip_orig_mod_prefix(model_data)
     _patch_missing_keys(model_data, model_config)
     with torch.device("meta"):
         model = GPT(model_config)
@@ -144,7 +184,7 @@ def pack_int4_signed(q):
     q = torch.where(q < 0, q + 16, q).to(torch.uint8)
     flat = q.reshape(-1)
     if flat.numel() % 2 == 1:
-        flat = torch.cat([flat, torch.zeros(1, dtype=torch.uint8)], dim=0)
+        flat = torch.cat([flat, torch.zeros(1, dtype=torch.uint8, device=flat.device)], dim=0)
     lo = flat[0::2]
     hi = flat[1::2] << 4
     return (lo | hi).contiguous()
@@ -163,6 +203,8 @@ def awq_quantize_weight(weight, act_mean, alpha):
 
 
 def export_awq(model_data, meta_data, channel_stats, alpha, quantize_embeddings):
+    if quantize_embeddings:
+        raise ValueError("AWQ embedding quantization is not supported because embeddings lack linear input-channel stats")
     export_tensors = {}
     tensor_meta = {}
     original_bytes = 0
@@ -220,22 +262,28 @@ def main():
     args = parse_args()
     root_dir, source_name = resolve_checkpoint_root(args)
     checkpoint_dir, model_tag, step, model_data, meta_data = load_state(root_dir, args.model_tag, args.step)
+    normalized_model_data, stripped_orig_mod_keys = strip_orig_mod_prefix(model_data)
 
     print(f"Loaded checkpoint: {checkpoint_dir} step {step}")
-    model = build_model_for_calibration(model_data, meta_data)
+    model = build_model_for_calibration(normalized_model_data, meta_data)
     tokenizer = get_tokenizer()
     sequences = calibration_sequences(tokenizer, args)
     print(f"Collected {len(sequences)} calibration prompts")
     channel_stats = gather_input_channel_stats(model, sequences)
     print(f"Gathered activation stats for {len(channel_stats)} linear modules")
+    if not channel_stats:
+        raise SystemExit("No linear activation stats were collected; cannot export an AWQ artifact")
 
     export_tensors, tensor_meta, stats = export_awq(
-        model_data={k.removeprefix("_orig_mod."): v for k, v in model_data.items()},
+        model_data=normalized_model_data,
         meta_data=meta_data,
         channel_stats=channel_stats,
         alpha=args.alpha,
-        quantize_embeddings=bool(args.quantize_embeddings),
+        quantize_embeddings=args.quantize_embeddings,
     )
+    if stats["quantized_tensors"] == 0:
+        raise SystemExit("No tensors were quantized; refusing to write a misleading AWQ artifact")
+    stats["stripped_orig_mod_keys"] = stripped_orig_mod_keys
 
     if args.output_dir is None:
         suffix = f"_{args.suffix}" if args.suffix else ""
@@ -256,8 +304,9 @@ def main():
             "source_step": step,
             "source_family": source_name,
             "quant_method": "awq_int4",
-            "quantize_embeddings": bool(args.quantize_embeddings),
+            "quantize_embeddings": args.quantize_embeddings,
             "model_config": meta_data.get("model_config"),
+            "artifact_format_version": 2,
         },
         artifact_path,
     )
@@ -269,9 +318,10 @@ def main():
                 "source_step": step,
                 "source_family": source_name,
                 "quant_method": "awq_int4",
-                "quantize_embeddings": bool(args.quantize_embeddings),
+                "quantize_embeddings": args.quantize_embeddings,
                 "stats": stats,
                 "model_config": meta_data.get("model_config"),
+                "artifact_format_version": 2,
             },
             f,
             indent=2,

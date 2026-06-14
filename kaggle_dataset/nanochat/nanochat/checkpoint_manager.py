@@ -166,6 +166,9 @@ def load_model(source, *args, **kwargs):
         "base": "base_checkpoints",
         "sft": "chatsft_checkpoints",
         "rl": "chatrl_checkpoints",
+        "ppo": "chatppo_checkpoints",
+        "ppo_standard": "chatppo_standard_checkpoints",
+        "grpo": "chatgrpo_checkpoints",
     }[source]
     base_dir = get_base_dir()
     checkpoints_dir = os.path.join(base_dir, model_dir)
@@ -177,6 +180,9 @@ def load_optimizer_state(source, device, rank, model_tag=None, step=None):
         "base": "base_checkpoints",
         "sft": "chatsft_checkpoints",
         "rl": "chatrl_checkpoints",
+        "ppo": "chatppo_checkpoints",
+        "ppo_standard": "chatppo_standard_checkpoints",
+        "grpo": "chatgrpo_checkpoints",
     }[source]
     base_dir = get_base_dir()
     checkpoints_dir = os.path.join(base_dir, model_dir)

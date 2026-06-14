@@ -17,9 +17,11 @@ python3 -m scripts.chat_ppo --preference-source=jsonl --preference-path=/path/pr
 """
 
 import argparse
+import copy
 import json
 import os
 import random
+import re
 
 import torch
 import torch.distributed as dist
@@ -35,14 +37,17 @@ from nanochat.report import get_report
 from tasks.gsm8k import GSM8K, extract_answer
 
 
+GSM_FINAL_ANSWER_RE = re.compile(r"(####\s*)(-?[0-9\.,]+)")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="PPO with reward model training for nanochat")
     parser.add_argument("--run", type=str, default="dummy")
     parser.add_argument("--device-type", type=str, default="")
-    parser.add_argument("--policy-source", type=str, default="sft", choices=["sft", "rl"])
+    parser.add_argument("--policy-source", type=str, default="sft", choices=["sft", "rl", "ppo"])
     parser.add_argument("--policy-tag", type=str, default=None)
     parser.add_argument("--policy-step", type=int, default=None)
-    parser.add_argument("--reference-source", type=str, default="sft", choices=["sft", "rl"])
+    parser.add_argument("--reference-source", type=str, default="sft", choices=["sft", "rl", "ppo"])
     parser.add_argument("--reference-tag", type=str, default=None)
     parser.add_argument("--reference-step", type=int, default=None)
     parser.add_argument("--preference-source", type=str, default="gsm8k", choices=["gsm8k", "jsonl"])
@@ -60,15 +65,16 @@ def parse_args():
     parser.add_argument("--device-batch-size", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument("--top-k", type=int, default=0, help="0 disables top-k; PPO ratios require full-support sampling")
     parser.add_argument("--clip-epsilon", type=float, default=0.2)
     parser.add_argument("--kl-beta", type=float, default=0.02)
+    parser.add_argument("--kl-reduction", type=str, default="sum", choices=["sum", "mean"])
+    parser.add_argument("--advantage-whiten", type=int, default=1, help="1=divide centered advantages by global batch std")
     parser.add_argument("--embedding-lr", type=float, default=0.05)
     parser.add_argument("--unembedding-lr", type=float, default=0.002)
     parser.add_argument("--matrix-lr", type=float, default=0.01)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--init-lr-frac", type=float, default=0.2)
-    parser.add_argument("--eval-every", type=int, default=50)
     parser.add_argument("--save-every", type=int, default=100)
     return parser.parse_args()
 
@@ -79,18 +85,47 @@ def flatten_assistant_content(content):
     return "".join(part["text"] for part in content)
 
 
-def synthesize_wrong_answer(answer_text):
-    gold = extract_answer(answer_text)
+def make_wrong_answer_value(gold):
     if gold is None:
-        return "I am not sure.\n#### 0"
+        return "0"
     try:
         if "." in gold:
-            wrong = str(float(gold) + 1.0)
-        else:
-            wrong = str(int(gold) + 1)
+            return str(float(gold) + 1.0)
+        return str(int(gold) + 1)
     except ValueError:
-        wrong = "0"
-    return f"I think the answer is {wrong}.\n#### {wrong}"
+        return "0"
+
+
+def replace_final_answer_marker(text, wrong):
+    matches = list(GSM_FINAL_ANSWER_RE.finditer(text))
+    if not matches:
+        return None
+    match = matches[-1]
+    return text[:match.start(2)] + wrong + text[match.end(2):]
+
+
+def synthesize_wrong_answer(answer_content):
+    if isinstance(answer_content, str):
+        gold = extract_answer(answer_content)
+        wrong = make_wrong_answer_value(gold)
+        replaced = replace_final_answer_marker(answer_content, wrong)
+        return replaced if replaced is not None else f"{answer_content.rstrip()}\n#### {wrong}"
+
+    rejected_content = copy.deepcopy(answer_content)
+    for part in reversed(rejected_content):
+        if part.get("type") != "text":
+            continue
+        gold = extract_answer(part["text"])
+        if gold is None:
+            continue
+        wrong = make_wrong_answer_value(gold)
+        replaced = replace_final_answer_marker(part["text"], wrong)
+        if replaced is not None:
+            part["text"] = replaced
+            return rejected_content
+
+    answer_text = flatten_assistant_content(answer_content)
+    return synthesize_wrong_answer(answer_text)
 
 
 def load_preferences(args):
@@ -112,7 +147,7 @@ def load_preferences(args):
     for i in range(max_examples):
         conversation = task[i]
         prompt = conversation["messages"][0]["content"]
-        chosen = flatten_assistant_content(conversation["messages"][1]["content"])
+        chosen = copy.deepcopy(conversation["messages"][1]["content"])
         rejected = synthesize_wrong_answer(chosen)
         prefs.append({"prompt": prompt, "chosen": chosen, "rejected": rejected})
     return prefs
@@ -161,10 +196,66 @@ def pad_rollout_batch(tokenizer, rollout_records, device):
     return torch.cat(padded_inputs, dim=0).to(device), torch.cat(padded_targets, dim=0).to(device)
 
 
-def compute_token_logps(model, inputs, targets):
+def policy_tensors_from_sequence(sequence, mask, device):
+    assert len(sequence) == len(mask), "rollout token ids and mask must have the same length"
+    ids = torch.tensor([sequence], dtype=torch.long, device=device)
+    mask_ids = torch.tensor([mask], dtype=torch.long, device=device)
+    inputs = ids[:, :-1]
+    targets = ids[:, 1:].clone()
+    targets[mask_ids[:, 1:] == 0] = -1
+    return inputs, targets
+
+
+def policy_sequence_from_rollout(tokenizer, sequence, mask):
+    bos = tokenizer.get_bos_token_id()
+    while sequence and sequence[-1] == bos:
+        sequence = sequence[:-1]
+        mask = mask[:-1]
+    return sequence, mask
+
+
+def reward_sequence_from_rollout(tokenizer, sequence):
+    bos = tokenizer.get_bos_token_id()
+    if sequence and sequence[-1] == bos:
+        return sequence[:-1]
+    return sequence
+
+
+def decode_generated_text(tokenizer, sequence, prompt_length):
+    bos = tokenizer.get_bos_token_id()
+    assistant_end = tokenizer.encode_special("<|assistant_end|>")
+    generated_tokens = sequence[prompt_length:]
+    while generated_tokens and generated_tokens[-1] in (assistant_end, bos):
+        generated_tokens = generated_tokens[:-1]
+    return tokenizer.decode(generated_tokens)
+
+
+def sample_rollout_sequence(engine, prompt_tokens, args, seed):
+    sequence = prompt_tokens.copy()
+    mask = [0] * len(prompt_tokens)
+    for token_column, token_masks in engine.generate(
+        prompt_tokens,
+        num_samples=1,
+        max_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        seed=seed,
+    ):
+        sequence.append(token_column[0])
+        mask.append(token_masks[0])
+    return sequence, mask
+
+
+def apply_sampling_temperature(logits, temperature):
+    assert temperature > 0.0, "PPO logprob ratios require a positive sampling temperature"
+    return logits / temperature
+
+
+def compute_token_logps(model, inputs, targets, temperature=1.0):
     valid = targets >= 0
     safe_targets = targets.clamp(min=0)
     logits = model(inputs)
+    logits = apply_sampling_temperature(logits, temperature)
     logprobs = F.log_softmax(logits, dim=-1)
     token_logps = logprobs.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1)
     token_logps = token_logps.masked_fill(~valid, 0.0)
@@ -172,11 +263,11 @@ def compute_token_logps(model, inputs, targets):
 
 
 @torch.no_grad()
-def collect_token_logps(model, inputs_all, targets_all, batch_size):
+def collect_token_logps(model, inputs_all, targets_all, batch_size, temperature=1.0):
     chunks = []
     for b0 in range(0, inputs_all.size(0), batch_size):
         b1 = min(b0 + batch_size, inputs_all.size(0))
-        token_logps, _ = compute_token_logps(model, inputs_all[b0:b1], targets_all[b0:b1])
+        token_logps, _ = compute_token_logps(model, inputs_all[b0:b1], targets_all[b0:b1], temperature)
         chunks.append(token_logps)
     return torch.cat(chunks, dim=0)
 
@@ -249,22 +340,61 @@ def maybe_load_reward_model_checkpoint(reward_model, load_path, device):
     print0(f"Loaded reward model checkpoint from {load_path}")
 
 
-def sampled_kl(token_logps, ref_token_logps, valid):
+def sampled_kl(token_logps, ref_token_logps, valid, reduction):
     valid_f = valid.to(token_logps.dtype)
-    lengths = valid.sum(dim=-1).clamp(min=1)
-    return ((token_logps - ref_token_logps) * valid_f).sum(dim=-1) / lengths
+    log_ref_over_policy = (ref_token_logps - token_logps).clamp(min=-20.0, max=20.0)
+    kl_tokens = torch.exp(log_ref_over_policy) - 1.0 - log_ref_over_policy
+    kl = (kl_tokens * valid_f).sum(dim=-1)
+    if reduction == "mean":
+        lengths = valid.sum(dim=-1).clamp(min=1)
+        kl = kl / lengths
+    return kl
 
 
-def compute_advantages(rewards):
-    if rewards.numel() == 1:
-        return torch.zeros_like(rewards)
-    return rewards - rewards.mean()
+def compute_advantages(returns, ddp_world_size, whiten):
+    if returns.numel() == 0:
+        return returns
+    count = torch.tensor(float(returns.numel()), dtype=returns.dtype, device=returns.device)
+    total = returns.sum()
+    sumsq = returns.square().sum()
+    if ddp_world_size > 1:
+        dist.all_reduce(total, op=dist.ReduceOp.SUM)
+        dist.all_reduce(sumsq, op=dist.ReduceOp.SUM)
+        dist.all_reduce(count, op=dist.ReduceOp.SUM)
+    if count.item() <= 1:
+        return torch.zeros_like(returns)
+    mean = total / count
+    advantages = returns - mean
+    if whiten:
+        var = (sumsq / count - mean.square()).clamp(min=1e-8)
+        advantages = advantages * torch.rsqrt(var)
+    return advantages
+
+
+def global_token_normalizer(valid_f, ddp_world_size):
+    count = valid_f.sum()
+    if ddp_world_size > 1:
+        dist.all_reduce(count, op=dist.ReduceOp.SUM)
+        count = count / ddp_world_size
+    return count.clamp(min=1.0)
+
+
+def stable_rollout_seed(step, ddp_rank, prompt_index):
+    seed = (step + 1) * 1_000_003 + (ddp_rank + 1) * 9_176 + prompt_index
+    return seed & 0x7FFFFFFF
 
 
 def get_ppo_lr_multiplier(step, total_steps):
     if total_steps <= 0:
         return 1.0
     return 1.0 - (step / total_steps)
+
+
+def resolve_reference_checkpoint(args):
+    same_source = args.reference_source == args.policy_source
+    ref_tag = args.reference_tag if args.reference_tag is not None else (args.policy_tag if same_source else None)
+    ref_step = args.reference_step if args.reference_step is not None else (args.policy_step if same_source else None)
+    return ref_tag, ref_step
 
 
 @torch.no_grad()
@@ -298,6 +428,14 @@ def main():
     assert args.prompt_batch_size > 0, "prompt_batch_size must be positive"
     assert args.device_batch_size > 0, "device_batch_size must be positive"
     assert args.ppo_steps > 0, "ppo_steps must be positive"
+    assert args.ppo_epochs > 0, "ppo_epochs must be positive"
+    assert args.max_new_tokens > 0, "max_new_tokens must be positive"
+    assert args.temperature > 0.0, "PPO training requires stochastic sampling; use --temperature > 0"
+    assert args.top_k == 0, "PPO ratios in this script require full-support sampling; use --top-k=0"
+    assert args.clip_epsilon >= 0.0, "clip_epsilon must be non-negative"
+    assert args.kl_beta >= 0.0, "kl_beta must be non-negative"
+    assert args.init_lr_frac >= 0.0, "init_lr_frac must be non-negative"
+    assert args.save_every > 0, "save_every must be positive"
 
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
@@ -307,8 +445,7 @@ def main():
     wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-ppo", name=args.run, config=user_config)
 
     policy_model, tokenizer, meta = load_model(args.policy_source, device, phase="train", model_tag=args.policy_tag, step=args.policy_step)
-    ref_tag = args.reference_tag if args.reference_tag is not None else args.policy_tag
-    ref_step = args.reference_step if args.reference_step is not None else args.policy_step
+    ref_tag, ref_step = resolve_reference_checkpoint(args)
     ref_model, _, _ = load_model(args.reference_source, device, phase="eval", model_tag=ref_tag, step=ref_step)
     ref_model.eval()
     for param in ref_model.parameters():
@@ -381,23 +518,19 @@ def main():
         rollout_records = []
         rewards_for_logging = []
         seq_lens_for_logging = []
-        for prompt in batch_prompts:
+        policy_model.eval()
+        for prompt_index, prompt in enumerate(batch_prompts):
             prompt_conv = {"messages": [{"role": "user", "content": prompt}, {"role": "assistant", "content": ""}]}
             prompt_tokens = tokenizer.render_for_completion(prompt_conv)
-            result_tokens, masks = engine.generate_batch(
-                prompt_tokens,
-                num_samples=1,
-                max_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_k=args.top_k,
-                seed=hash((step, prompt)) & 0x7FFFFFFF,
-            )
-            sequence = result_tokens[0]
-            generated_text = tokenizer.decode(sequence[len(prompt_tokens):])
-            sampled_conv = build_conversation(prompt, generated_text)
-            ids, inputs, targets, last_positions = collate_conversations(tokenizer, [sampled_conv], device)
+            sequence, mask = sample_rollout_sequence(engine, prompt_tokens, args, stable_rollout_seed(step, ddp_rank, prompt_index))
+            generated_text = decode_generated_text(tokenizer, sequence, len(prompt_tokens))
+            policy_sequence, policy_mask = policy_sequence_from_rollout(tokenizer, sequence, mask)
+            inputs, targets = policy_tensors_from_sequence(policy_sequence, policy_mask, device)
+            reward_sequence = reward_sequence_from_rollout(tokenizer, sequence)
+            reward_ids = torch.tensor([reward_sequence], dtype=torch.long, device=device)
+            last_positions = torch.tensor([len(reward_sequence) - 1], dtype=torch.long, device=device)
             with torch.no_grad():
-                rm_score = reward_model(ids, last_positions)
+                rm_score = reward_model(reward_ids, last_positions)
             rollout_records.append(
                 {
                     "prompt": prompt,
@@ -413,56 +546,78 @@ def main():
 
         inputs_all, targets_all = pad_rollout_batch(tokenizer, rollout_records, device)
         rewards_all = torch.stack([r["reward"] for r in rollout_records])
-        old_token_logps_all = collect_token_logps(policy_model, inputs_all, targets_all, args.device_batch_size)
-        ref_token_logps_all = collect_token_logps(ref_model, inputs_all, targets_all, args.device_batch_size)
+        old_token_logps_all = collect_token_logps(policy_model, inputs_all, targets_all, args.device_batch_size, args.temperature)
+        ref_token_logps_all = collect_token_logps(ref_model, inputs_all, targets_all, args.device_batch_size, args.temperature)
         old_valid = targets_all >= 0
-        kl_penalty = sampled_kl(old_token_logps_all, ref_token_logps_all, old_valid)
+        kl_penalty = sampled_kl(old_token_logps_all, ref_token_logps_all, old_valid, args.kl_reduction)
         returns = rewards_all - args.kl_beta * kl_penalty
-        advantages_all = compute_advantages(returns)
+        advantages_all = compute_advantages(returns, ddp_world_size, bool(args.advantage_whiten))
+        valid_f_all = old_valid.to(old_token_logps_all.dtype)
+        loss_normalizer = global_token_normalizer(valid_f_all, ddp_world_size)
 
-        ratio_logging = []
+        ratio_sum_logging = 0.0
+        ratio_count_logging = 0.0
+        clipfrac_sum_logging = 0.0
+        approx_kl_sum_logging = 0.0
         loss_logging = []
         policy_model.train()
         for epoch in range(args.ppo_epochs):
             optimizer.zero_grad(set_to_none=True)
+            epoch_loss = 0.0
             for b0 in range(0, inputs_all.size(0), args.device_batch_size):
                 b1 = min(b0 + args.device_batch_size, inputs_all.size(0))
                 inputs = inputs_all[b0:b1]
                 targets = targets_all[b0:b1]
                 old_token_logps = old_token_logps_all[b0:b1]
-                advantages = advantages_all[b0:b1]
+                advantages = advantages_all[b0:b1].unsqueeze(-1)
 
-                token_logps, valid = compute_token_logps(policy_model, inputs, targets)
+                token_logps, valid = compute_token_logps(policy_model, inputs, targets, args.temperature)
                 valid_f = valid.to(token_logps.dtype)
-                ratio = torch.exp((token_logps - old_token_logps).clamp(min=-20.0, max=20.0))
-                unclipped = ratio * advantages.unsqueeze(-1)
-                clipped = ratio.clamp(1.0 - args.clip_epsilon, 1.0 + args.clip_epsilon) * advantages.unsqueeze(-1)
-                surrogate = torch.minimum(unclipped, clipped)
-                loss = -(surrogate * valid_f).sum() / valid.sum().clamp(min=1)
+                log_ratio = (token_logps - old_token_logps).clamp(min=-20.0, max=20.0)
+                ratio = torch.exp(log_ratio)
+                unclipped = ratio * advantages
+                clipped = ratio.clamp(1.0 - args.clip_epsilon, 1.0 + args.clip_epsilon) * advantages
+                surrogate = torch.minimum(unclipped, clipped) * valid_f
+                loss = -surrogate.sum() / loss_normalizer
                 loss.backward()
-                loss_logging.append(loss.detach().item())
-                ratio_logging.append((ratio * valid_f).sum().item() / valid.sum().clamp(min=1).item())
+                epoch_loss += loss.detach().item()
+                ratio_sum_logging += (ratio * valid_f).sum().item()
+                ratio_count_logging += valid_f.sum().item()
+                clipfrac_sum_logging += (((ratio - 1.0).abs() > args.clip_epsilon).to(token_logps.dtype) * valid_f).sum().item()
+                approx_kl_sum_logging += (((ratio - 1.0) - log_ratio) * valid_f).sum().item()
             optimizer.step()
+            loss_logging.append(epoch_loss)
 
         mean_reward = sum(rewards_for_logging) / len(rewards_for_logging)
         mean_seq_len = sum(seq_lens_for_logging) / len(seq_lens_for_logging)
         mean_loss = sum(loss_logging) / len(loss_logging) if loss_logging else 0.0
-        mean_ratio = sum(ratio_logging) / len(ratio_logging) if ratio_logging else 1.0
         mean_return = returns.mean().detach()
         mean_kl = kl_penalty.mean().detach()
+        ratio_sum = torch.tensor(ratio_sum_logging, device=device)
+        ratio_count = torch.tensor(ratio_count_logging, device=device)
+        clipfrac_sum = torch.tensor(clipfrac_sum_logging, device=device)
+        approx_kl_sum = torch.tensor(approx_kl_sum_logging, device=device)
+        if ddp:
+            for tensor in [ratio_sum, ratio_count, clipfrac_sum, approx_kl_sum]:
+                dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        ratio_count = ratio_count.clamp(min=1.0)
+        mean_ratio = (ratio_sum / ratio_count).item()
+        mean_clipfrac = (clipfrac_sum / ratio_count).item()
+        mean_approx_kl = (approx_kl_sum / ratio_count).item()
 
         if ddp:
-            stats = [torch.tensor(mean_reward, device=device), torch.tensor(mean_seq_len, device=device), torch.tensor(mean_loss, device=device), torch.tensor(mean_ratio, device=device), mean_return, mean_kl]
+            stats = [torch.tensor(mean_reward, device=device), torch.tensor(mean_seq_len, device=device), torch.tensor(mean_loss, device=device), mean_return, mean_kl]
             for tensor in stats:
                 dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
-            mean_reward, mean_seq_len, mean_loss, mean_ratio, mean_return, mean_kl = [t.item() for t in stats]
+            mean_reward, mean_seq_len, mean_loss, mean_return, mean_kl = [t.item() for t in stats]
         else:
             mean_return = mean_return.item()
             mean_kl = mean_kl.item()
 
         print0(
             f"Step {step} | ppo_loss: {mean_loss:.6f} | reward: {mean_reward:.4f} | "
-            f"return: {mean_return:.4f} | sampled_kl: {mean_kl:.4f} | ratio: {mean_ratio:.4f}"
+            f"return: {mean_return:.4f} | sampled_kl: {mean_kl:.4f} | "
+            f"ratio: {mean_ratio:.4f} | clipfrac: {mean_clipfrac:.4f}"
         )
         wandb_run.log(
             {
@@ -472,6 +627,8 @@ def main():
                 "return": mean_return,
                 "sampled_kl": mean_kl,
                 "ratio_mean": mean_ratio,
+                "clipfrac": mean_clipfrac,
+                "approx_kl_to_old": mean_approx_kl,
                 "sequence_length": mean_seq_len,
                 "lrm": lrm,
             }

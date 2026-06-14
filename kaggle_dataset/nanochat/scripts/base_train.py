@@ -18,6 +18,7 @@ import json
 import time
 import math
 import argparse
+import traceback
 from dataclasses import asdict
 from contextlib import contextmanager
 
@@ -35,6 +36,107 @@ from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
 print_banner()
+
+# -----------------------------------------------------------------------------
+# DDP / NCCL debugging helpers
+# Enable with environment variables:
+#   NANOCHAT_DEBUG_DIST=1       print per-rank debug logs
+#   NANOCHAT_DEBUG_STDOUT=1     also mirror debug logs to stdout (file-only by default)
+#   NANOCHAT_DEBUG_STACK=1      include stack traces for logged collectives (verbose)
+#   NANOCHAT_DEBUG_STEPS=2      how many optimizer steps to debug-print
+# Logs are written to /kaggle/working/nanochat_debug_rank{rank}.log
+_DEBUG_DIST = os.environ.get("NANOCHAT_DEBUG_DIST", "0") == "1"
+_DEBUG_STDOUT = os.environ.get("NANOCHAT_DEBUG_STDOUT", "0") == "1"
+_DEBUG_STACK = os.environ.get("NANOCHAT_DEBUG_STACK", "0") == "1"
+_DEBUG_STEPS = int(os.environ.get("NANOCHAT_DEBUG_STEPS", "2"))
+_DEBUG_COLL_SEQ = 0
+_TRAIN_PRINT_EVERY = max(1, int(os.environ.get("NANOCHAT_TRAIN_PRINT_EVERY", "1")))
+
+def dprint(msg):
+    """Write a per-rank debug log, optionally mirroring to stdout."""
+    if not _DEBUG_DIST:
+        return
+
+    rank = int(os.environ.get("RANK", "-1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+
+    try:
+        cuda_dev = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+    except Exception:
+        cuda_dev = "unknown"
+
+    line = (
+        f"[DBG {time.strftime('%H:%M:%S')} "
+        f"rank={rank}/{world} local={local_rank} cuda={cuda_dev}] {msg}"
+    )
+
+    try:
+        with open(f"/kaggle/working/nanochat_debug_rank{rank}.log", "a") as f:
+            f.write(line + "\n")
+            f.flush()
+    except Exception:
+        pass
+
+    if _DEBUG_STDOUT:
+        print(line, flush=True)
+
+
+def should_debug_step(step):
+    return _DEBUG_DIST and step < _DEBUG_STEPS
+
+
+def install_dist_debug_hooks():
+    """Wrap dist.all_reduce so we can see which rank enters which collective."""
+    global _DEBUG_COLL_SEQ
+
+    if not _DEBUG_DIST:
+        return
+
+    if getattr(dist, "_nanochat_debug_wrapped", False):
+        return
+
+    dist._nanochat_debug_wrapped = True
+    orig_all_reduce = dist.all_reduce
+
+    def all_reduce_debug(tensor, *args, **kwargs):
+        global _DEBUG_COLL_SEQ
+        _DEBUG_COLL_SEQ += 1
+
+        try:
+            numel = tensor.numel()
+            shape = tuple(tensor.shape)
+            dtype = tensor.dtype
+            dev = tensor.device
+        except Exception:
+            numel, shape, dtype, dev = -1, "?", "?", "?"
+
+        async_op = kwargs.get("async_op", False)
+
+        # The observed crash was a scalar ALLREDUCE NumelIn=1.
+        # Always log tiny collectives, first few collectives, and milestones.
+        should_log = (numel <= 4) or (_DEBUG_COLL_SEQ <= 20) or (_DEBUG_COLL_SEQ % 1000 == 0)
+
+        if should_log:
+            dprint(
+                f"ENTER all_reduce seq={_DEBUG_COLL_SEQ} "
+                f"numel={numel} shape={shape} dtype={dtype} device={dev} async={async_op}"
+            )
+            if _DEBUG_STACK:
+                stack = ''.join(traceback.format_stack(limit=12))
+                dprint("STACK all_reduce:\n" + stack)
+
+        work = orig_all_reduce(tensor, *args, **kwargs)
+
+        if should_log:
+            dprint(f"RETURN all_reduce seq={_DEBUG_COLL_SEQ}")
+
+        return work
+
+    dist.all_reduce = all_reduce_debug
+    dprint("Installed dist.all_reduce debug hook")
+# -----------------------------------------------------------------------------
+
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -84,6 +186,8 @@ user_config = vars(args).copy()  # for logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
+install_dist_debug_hooks()
+dprint(f"After compute_init: ddp={ddp}, rank={ddp_rank}, local_rank={ddp_local_rank}, world_size={ddp_world_size}, device={device}")
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
@@ -243,7 +347,12 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if os.environ.get("NANOCHAT_DISABLE_COMPILE", "0") == "1":
+    print0("torch.compile disabled by NANOCHAT_DISABLE_COMPILE=1")
+    dprint("torch.compile disabled")
+else:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+    dprint("torch.compile enabled")
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -321,9 +430,10 @@ if resuming:
 
 # -----------------------------------------------------------------------------
 # GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
-scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
+scaler = torch.amp.GradScaler("cuda", init_scale=1024) if COMPUTE_DTYPE == torch.float16 else None
 if scaler is not None:
     print0("GradScaler enabled for fp16 training")
+    dprint(f"GradScaler enabled: initial scale={scaler.get_scale()}")
 
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
@@ -507,15 +617,65 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    debug_this_step = should_debug_step(step)
+    if debug_this_step:
+        dprint(f"step={step}: START training step, grad_accum_steps={grad_accum_steps}")
+
     for micro_step in range(grad_accum_steps):
+        if debug_this_step:
+            dprint(f"step={step} micro={micro_step}: BEFORE forward")
+
         loss = model(x, y)
+
+        if debug_this_step:
+            try:
+                dprint(f"step={step} micro={micro_step}: AFTER forward raw_loss={loss.detach().float().item()}")
+            except Exception as e:
+                dprint(f"step={step} micro={micro_step}: AFTER forward, but loss.item() failed: {repr(e)}")
+
+        if debug_this_step:
+            dprint(f"step={step} micro={micro_step}: BEFORE train_loss detach")
+
         train_loss = loss.detach() # for logging
+
+        if debug_this_step:
+            dprint(f"step={step} micro={micro_step}: AFTER train_loss detach")
+            dprint(f"step={step} micro={micro_step}: BEFORE loss normalize")
+
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+
+        if debug_this_step:
+            dprint(f"step={step} micro={micro_step}: AFTER loss normalize")
+
+        if debug_this_step:
+            dprint(f"step={step} micro={micro_step}: BEFORE backward")
+
         if scaler is not None:
-            scaler.scale(loss).backward()
+            if debug_this_step:
+                dprint(f"step={step} micro={micro_step}: BEFORE scaler.scale(loss)")
+            scaled_loss = scaler.scale(loss)
+            if debug_this_step:
+                dprint(f"step={step} micro={micro_step}: AFTER scaler.scale(loss), BEFORE scaled backward")
+            scaled_loss.backward()
+            if debug_this_step:
+                dprint(f"step={step} micro={micro_step}: AFTER scaled backward call")
         else:
+            if debug_this_step:
+                dprint(f"step={step} micro={micro_step}: BEFORE raw backward call")
             loss.backward()
+            if debug_this_step:
+                dprint(f"step={step} micro={micro_step}: AFTER raw backward call")
+
+        if debug_this_step:
+            dprint(f"step={step} micro={micro_step}: AFTER backward")
+
+        if debug_this_step:
+            dprint(f"step={step} micro={micro_step}: BEFORE next(train_loader)")
+
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+
+        if debug_this_step:
+            dprint(f"step={step} micro={micro_step}: AFTER next(train_loader)")
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -526,17 +686,72 @@ while True:
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
     if scaler is not None:
+        if debug_this_step:
+            dprint(f"step={step}: BEFORE scaler.unscale_ scale={scaler.get_scale()}")
+
         scaler.unscale_(optimizer)
-        # In distributed training, all ranks must agree on whether to skip the step.
-        # Each rank may independently encounter inf/nan gradients, so we all-reduce
-        # the found_inf flag (MAX = if any rank found inf, all ranks skip).
+
+        if debug_this_step:
+            dprint(f"step={step}: AFTER scaler.unscale_")
+
+        # Build one explicit overflow flag on every rank.
+        # This is safer for this custom distributed optimizer than scaler.step(optimizer),
+        # because every rank makes the same Python branch decision.
+        optimizer_state = scaler._per_optimizer_states[id(optimizer)]
+        found_inf_per_device = optimizer_state["found_inf_per_device"]
+
+        found_inf = torch.zeros((), dtype=torch.float32, device=device)
+
+        if debug_this_step:
+            dprint(f"step={step}: local found_inf_per_device keys={list(found_inf_per_device.keys())}")
+
+        for dev_key, v in found_inf_per_device.items():
+            if debug_this_step:
+                dprint(f"step={step}: local found_inf[{dev_key}]={v.detach().float().item()}")
+            found_inf = torch.maximum(found_inf, v.to(device))
+
+        if debug_this_step:
+            dprint(f"step={step}: BEFORE found_inf all_reduce local_value={found_inf.item()}")
+
         if is_ddp_initialized():
-            for v in scaler._found_inf_per_device(optimizer).values():
-                dist.all_reduce(v, op=dist.ReduceOp.MAX)
-        scaler.step(optimizer)
+            # Every rank must call this exactly once.
+            dist.all_reduce(found_inf, op=dist.ReduceOp.MAX)
+
+        if debug_this_step:
+            dprint(f"step={step}: AFTER found_inf all_reduce synced_value={found_inf.item()}")
+
+        # Write synchronized value back for scaler.update().
+        if len(found_inf_per_device) == 0:
+            found_inf_per_device[torch.device(device)] = found_inf
+        else:
+            for v in found_inf_per_device.values():
+                v.copy_(found_inf.to(v.device))
+
+        # Explicit synchronized step/skip. This is the main correction.
+        if found_inf.item() == 0.0:
+            if debug_this_step:
+                dprint(f"step={step}: BEFORE optimizer.step()")
+            optimizer.step()
+            if debug_this_step:
+                dprint(f"step={step}: AFTER optimizer.step()")
+        else:
+            dprint(f"step={step}: SKIP optimizer.step() due to fp16 overflow, scale={scaler.get_scale()}")
+
+        if debug_this_step:
+            dprint(f"step={step}: BEFORE scaler.update()")
+
         scaler.update()
+
+        if debug_this_step:
+            dprint(f"step={step}: AFTER scaler.update() new_scale={scaler.get_scale()}")
+
     else:
+        if debug_this_step:
+            dprint(f"step={step}: BEFORE optimizer.step() fp32/bf16")
         optimizer.step()
+        if debug_this_step:
+            dprint(f"step={step}: AFTER optimizer.step() fp32/bf16")
+
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
@@ -564,7 +779,8 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    if step < 5 or step % _TRAIN_PRINT_EVERY == 0 or step == num_iterations - 1:
+        print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,

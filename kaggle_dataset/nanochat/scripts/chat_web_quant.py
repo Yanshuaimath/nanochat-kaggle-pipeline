@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 from contextlib import asynccontextmanager
@@ -60,7 +61,20 @@ parser.add_argument("-m", "--max-tokens", type=int, default=512, help="Default m
 parser.add_argument('-p', '--port', type=int, default=8001, help='Port to run the server on')
 parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
 parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind the server to')
+parser.add_argument('--runtime-quantized', action='store_true', help='Keep eligible Linear weights as quantized runtime buffers instead of loading a dequantized float model')
+parser.add_argument('--dequantize-runtime', action='store_true', help=argparse.SUPPRESS)
 args = parser.parse_args()
+
+if args.runtime_quantized and args.dequantize_runtime:
+    parser.error("--runtime-quantized and --dequantize-runtime cannot be used together")
+if args.num_gpus <= 0:
+    parser.error("--num-gpus must be positive")
+if not math.isfinite(args.temperature) or not (MIN_TEMPERATURE <= args.temperature <= MAX_TEMPERATURE):
+    parser.error(f"--temperature must be between {MIN_TEMPERATURE} and {MAX_TEMPERATURE}")
+if not (MIN_TOP_K <= args.top_k <= MAX_TOP_K):
+    parser.error(f"--top-k must be between {MIN_TOP_K} and {MAX_TOP_K}")
+if not (MIN_MAX_TOKENS <= args.max_tokens <= MAX_MAX_TOKENS):
+    parser.error(f"--max-tokens must be between {MIN_MAX_TOKENS} and {MAX_MAX_TOKENS}")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -80,21 +94,28 @@ class Worker:
     engine: Engine
     tokenizer: object
     quant_method: str
+    runtime_quantized: bool
 
 
 class WorkerPool:
     def __init__(self, num_gpus: Optional[int] = None):
         if num_gpus is None:
             num_gpus = torch.cuda.device_count() if device_type == "cuda" else 1
+        if num_gpus <= 0:
+            raise ValueError("WorkerPool requires at least one worker")
+        if device_type == "cuda" and num_gpus > torch.cuda.device_count():
+            raise ValueError(f"Requested {num_gpus} GPU workers but only {torch.cuda.device_count()} CUDA devices are available")
+        if device_type != "cuda" and num_gpus != 1:
+            raise ValueError("Only CUDA supports multiple workers/GPUs. cpu|mps must use --num-gpus 1.")
         self.num_gpus = num_gpus
         self.workers: List[Worker] = []
         self.available_workers: asyncio.Queue = asyncio.Queue()
 
     async def initialize(self, quant_artifact: str):
         print(f"Initializing quantized worker pool with {self.num_gpus} workers...")
-        if self.num_gpus > 1:
-            assert device_type == "cuda", "Only CUDA supports multiple workers/GPUs. cpu|mps does not."
         quant_artifact = os.path.abspath(os.path.expanduser(quant_artifact))
+        if not os.path.exists(quant_artifact):
+            raise FileNotFoundError(f"Quantized artifact not found: {quant_artifact}")
 
         for gpu_id in range(self.num_gpus):
             if device_type == "cuda":
@@ -104,13 +125,21 @@ class WorkerPool:
                 device = torch.device(device_type)
                 print(f"Loading quantized artifact on {device_type}...")
 
-            model, tokenizer, artifact = load_quantized_model(quant_artifact, device)
+            runtime_quantized = args.runtime_quantized and device.type != "mps"
+            if args.runtime_quantized and device.type == "mps":
+                print("Runtime-quantized Linear modules are disabled on MPS; loading a dequantized model.")
+            model, tokenizer, artifact = load_quantized_model(
+                quant_artifact,
+                device,
+                runtime_quantized=runtime_quantized,
+            )
             worker = Worker(
                 gpu_id=gpu_id,
                 device=device,
                 engine=Engine(model, tokenizer),
                 tokenizer=tokenizer,
                 quant_method=artifact.get("quant_method", "unknown"),
+                runtime_quantized=artifact.get("runtime_quantized", False),
             )
             self.workers.append(worker)
             await self.available_workers.put(worker)
@@ -277,7 +306,7 @@ async def chat_completions(request: ChatRequest):
                     max_new_tokens=request.max_tokens,
                     top_k=request.top_k,
                 ):
-                    chunk_data = json.loads(chunk.replace("data: ", "").strip())
+                    chunk_data = json.loads(chunk.removeprefix("data: ").strip())
                     if "token" in chunk_data:
                         response_tokens.append(chunk_data["token"])
                     yield chunk
@@ -300,6 +329,7 @@ async def health():
         "ready": worker_pool is not None and len(worker_pool.workers) > 0,
         "num_gpus": worker_pool.num_gpus if worker_pool else 0,
         "available_workers": worker_pool.available_workers.qsize() if worker_pool else 0,
+        "runtime_quantized": any(w.runtime_quantized for w in worker_pool.workers) if worker_pool else False,
     }
 
 
@@ -315,6 +345,7 @@ async def stats():
                 "gpu_id": w.gpu_id,
                 "device": str(w.device),
                 "quant_method": w.quant_method,
+                "runtime_quantized": w.runtime_quantized,
             }
             for w in worker_pool.workers
         ],
@@ -326,5 +357,6 @@ if __name__ == "__main__":
 
     print("Starting NanoChat Quantized Web Server")
     print(f"Quant artifact: {args.quant_artifact}")
+    print(f"Runtime quantized: {args.runtime_quantized and device_type != 'mps'}")
     print(f"Temperature: {args.temperature}, Top-k: {args.top_k}, Max tokens: {args.max_tokens}")
     uvicorn.run(app, host=args.host, port=args.port)

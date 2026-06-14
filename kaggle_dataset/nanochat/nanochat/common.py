@@ -117,6 +117,7 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
 def print0(s="",**kwargs):
     ddp_rank = int(os.environ.get('RANK', 0))
     if ddp_rank == 0:
+        kwargs.setdefault("flush", True)
         print(s, **kwargs)
 
 def print_banner():
@@ -198,7 +199,7 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
         device = torch.device("cuda", ddp_local_rank)
         torch.cuda.set_device(device)  # make "cuda" default to this device
         dist.init_process_group(backend="nccl", device_id=device)
-        dist.barrier()
+        dist.barrier(device_ids=[ddp_local_rank])
     else:
         device = torch.device(device_type) # mps|cpu
 

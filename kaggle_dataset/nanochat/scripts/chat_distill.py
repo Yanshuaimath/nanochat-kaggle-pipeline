@@ -17,8 +17,8 @@ python3 -m scripts.chat_distill --data-path teacher_prefs.jsonl --data-format pr
 """
 
 import argparse
+import copy
 import json
-import math
 import os
 import random
 import time
@@ -50,12 +50,14 @@ class DistillJSON(Task):
                     self.rows.append(row)
                 elif data_format == "preference":
                     assert isinstance(row, dict), f"Expected object JSONL for preference, got {type(row)}"
-                    self.rows.append(
-                        [
-                            {"role": "user", "content": row["prompt"]},
-                            {"role": "assistant", "content": row["chosen"]},
-                        ]
-                    )
+                    if "messages" in row:
+                        messages = copy.deepcopy(row["messages"])
+                    else:
+                        messages = [{"role": "user", "content": row["prompt"]}]
+                    while messages and messages[-1]["role"] == "assistant":
+                        messages.pop()
+                    messages.append({"role": "assistant", "content": row["chosen"]})
+                    self.rows.append(messages)
                 else:
                     raise ValueError(f"Unsupported data_format: {data_format}")
 
@@ -100,7 +102,9 @@ def split_dataset(dataset, val_ratio, seed):
     indices = list(range(len(dataset)))
     random.Random(seed).shuffle(indices)
     val_size = int(len(indices) * val_ratio)
-    val_idx = set(indices[:val_size])
+    if val_ratio > 0.0 and len(indices) > 1:
+        val_size = max(1, val_size)
+        val_size = min(len(indices) - 1, val_size)
     train_rows = [dataset.rows[i] for i in indices[val_size:]]
     val_rows = [dataset.rows[i] for i in indices[:val_size]]
     train_ds = DistillJSON.__new__(DistillJSON)
@@ -116,18 +120,60 @@ def split_dataset(dataset, val_ratio, seed):
     return train_ds, val_ds
 
 
-def make_batches(dataset, tokenizer, batch_size, max_seq_len, device, shuffle, seed):
-    bos = tokenizer.get_bos_token_id()
-    indices = list(range(len(dataset)))
+def num_global_batches(num_examples, batch_size, ddp_world_size):
+    if num_examples == 0:
+        return 0
+    global_batch_size = batch_size * ddp_world_size
+    return (num_examples + global_batch_size - 1) // global_batch_size
+
+
+def iter_rank_indices(num_examples, batch_size, ddp_rank, ddp_world_size, shuffle, seed, pad_to_global):
+    indices = list(range(num_examples))
     if shuffle:
         random.Random(seed).shuffle(indices)
-    for i in range(0, len(indices), batch_size):
-        chunk = indices[i:i + batch_size]
+    if not indices:
+        return
+
+    global_batch_size = batch_size * ddp_world_size
+    if pad_to_global:
+        steps = num_global_batches(num_examples, batch_size, ddp_world_size)
+        total_size = steps * global_batch_size
+        if total_size > len(indices):
+            repeat = (total_size + len(indices) - 1) // len(indices)
+            indices = (indices * repeat)[:total_size]
+    else:
+        total_size = len(indices)
+
+    for global_start in range(0, total_size, global_batch_size):
+        local_start = global_start + ddp_rank * batch_size
+        chunk = indices[local_start:local_start + batch_size]
+        if chunk:
+            yield chunk
+
+
+def render_for_distill(tokenizer, conversation, max_seq_len):
+    max_tokens = max_seq_len + 1
+    ids, mask = tokenizer.render_conversation(conversation, max_tokens=1_000_000_000)
+    if len(ids) > max_tokens:
+        bos = tokenizer.get_bos_token_id()
+        keep = max_tokens - 1
+        ids = [bos] + ids[-keep:]
+        mask = [0] + mask[-keep:]
+        for i in range(1, len(mask)):
+            if mask[i] == 0:
+                break
+            mask[i] = 0
+    return ids, mask
+
+
+def make_batches(dataset, tokenizer, batch_size, max_seq_len, device, shuffle, seed, ddp_rank=0, ddp_world_size=1, pad_to_global=False):
+    bos = tokenizer.get_bos_token_id()
+    for chunk in iter_rank_indices(len(dataset), batch_size, ddp_rank, ddp_world_size, shuffle, seed, pad_to_global):
         conversations = [dataset[idx] for idx in chunk]
         ids_rows = []
         mask_rows = []
         for conversation in conversations:
-            ids, mask = tokenizer.render_conversation(conversation, max_tokens=max_seq_len + 1)
+            ids, mask = render_for_distill(tokenizer, conversation, max_seq_len)
             ids_rows.append(ids)
             mask_rows.append(mask)
         max_len = max(len(row) for row in ids_rows)
@@ -145,24 +191,38 @@ def make_batches(dataset, tokenizer, batch_size, max_seq_len, device, shuffle, s
 def evaluate_dataset(model, dataset, tokenizer, batch_size, max_seq_len, device, ddp_rank, ddp_world_size):
     if len(dataset) == 0:
         return 0.0
-    losses = []
-    for step, (inputs, targets) in enumerate(make_batches(dataset, tokenizer, batch_size, max_seq_len, device, shuffle=False, seed=0)):
-        if step % ddp_world_size != ddp_rank:
+    loss_sum = torch.tensor(0.0, dtype=torch.float, device=device)
+    token_count = torch.tensor(0, dtype=torch.long, device=device)
+    for inputs, targets in make_batches(
+        dataset,
+        tokenizer,
+        batch_size,
+        max_seq_len,
+        device,
+        shuffle=False,
+        seed=0,
+        ddp_rank=ddp_rank,
+        ddp_world_size=ddp_world_size,
+        pad_to_global=False,
+    ):
+        valid_tokens = (targets >= 0).sum()
+        if valid_tokens.item() == 0:
             continue
-        loss = model(inputs, targets)
-        losses.append(loss.detach())
-    if not losses:
-        loss_tensor = torch.tensor(0.0, device=device)
-    else:
-        loss_tensor = torch.stack(losses).mean()
+        loss_sum += model(inputs, targets, loss_reduction="sum").detach()
+        token_count += valid_tokens
     if ddp_world_size > 1:
-        dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
-    return loss_tensor.item()
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+    if token_count.item() == 0:
+        return 0.0
+    return (loss_sum / token_count).item()
 
 
-def get_lr_multiplier(progress, warmup_ratio, final_lr_frac):
-    if progress < warmup_ratio:
-        return (progress + 1e-8) / max(warmup_ratio, 1e-8)
+def get_lr_multiplier(progress, init_lr_frac, warmup_ratio, final_lr_frac):
+    progress = min(max(progress, 0.0), 1.0)
+    if warmup_ratio > 0.0 and progress < warmup_ratio:
+        warmup_progress = progress / warmup_ratio
+        return init_lr_frac + (1.0 - init_lr_frac) * warmup_progress
     decay_progress = (progress - warmup_ratio) / max(1.0 - warmup_ratio, 1e-8)
     decay_progress = min(max(decay_progress, 0.0), 1.0)
     return (1.0 - decay_progress) * 1.0 + decay_progress * final_lr_frac
@@ -171,6 +231,15 @@ def get_lr_multiplier(progress, warmup_ratio, final_lr_frac):
 def main():
     args = parse_args()
     user_config = vars(args).copy()
+    assert 0.0 <= args.val_ratio < 1.0, "--val-ratio must be in [0, 1)"
+    assert args.num_epochs >= 0, "--num-epochs must be non-negative"
+    assert args.batch_size > 0, "--batch-size must be positive"
+    assert args.max_seq_len >= 2, "--max-seq-len must be at least 2"
+    assert 0.0 <= args.init_lr_frac <= 1.0, "--init-lr-frac must be between 0 and 1"
+    assert 0.0 <= args.warmup_ratio <= 1.0, "--warmup-ratio must be between 0 and 1"
+    assert 0.0 <= args.final_lr_frac <= 1.0, "--final-lr-frac must be between 0 and 1"
+    assert args.save_every > 0, "--save-every must be positive"
+    assert args.eval_every >= 0, "--eval-every must be non-negative"
 
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
@@ -183,6 +252,7 @@ def main():
     dataset = DistillJSON(args.data_path, data_format=args.data_format)
     train_dataset, val_dataset = split_dataset(dataset, args.val_ratio, args.shuffle_seed)
     print0(f"Distill dataset: train={len(train_dataset)} | val={len(val_dataset)}")
+    assert len(train_dataset) > 0, "No distillation training examples loaded"
 
     optimizer = model.setup_optimizer(
         unembedding_lr=args.unembedding_lr,
@@ -191,10 +261,9 @@ def main():
         weight_decay=args.weight_decay,
     )
     for group in optimizer.param_groups:
-        group["lr"] = group["lr"] * args.init_lr_frac
         group["initial_lr"] = group["lr"]
 
-    train_steps_per_epoch = max(1, math.ceil(len(train_dataset) / max(args.batch_size * ddp_world_size, 1)))
+    train_steps_per_epoch = num_global_batches(len(train_dataset), args.batch_size, ddp_world_size)
     total_steps = max(1, train_steps_per_epoch * args.num_epochs)
     print0(f"Planned distillation steps: {total_steps}")
 
@@ -212,17 +281,25 @@ def main():
             device,
             shuffle=True,
             seed=args.shuffle_seed + epoch,
+            ddp_rank=ddp_rank,
+            ddp_world_size=ddp_world_size,
+            pad_to_global=ddp_world_size > 1,
         )
-        for local_step, (inputs, targets) in enumerate(batch_iter):
-            if local_step % ddp_world_size != ddp_rank:
+        for inputs, targets in batch_iter:
+            valid_tokens = (targets >= 0).sum()
+            global_valid_tokens = valid_tokens.detach().clone()
+            if ddp:
+                dist.all_reduce(global_valid_tokens, op=dist.ReduceOp.SUM)
+            if global_valid_tokens.item() == 0:
+                print0(f"step {step:05d} | epoch {epoch} | skipped batch with no supervised tokens")
                 continue
 
             progress = step / max(total_steps - 1, 1)
-            lrm = get_lr_multiplier(progress, args.warmup_ratio, args.final_lr_frac)
+            lrm = get_lr_multiplier(progress, args.init_lr_frac, args.warmup_ratio, args.final_lr_frac)
             for group in optimizer.param_groups:
                 group["lr"] = group["initial_lr"] * lrm
 
-            if args.eval_every > 0 and (step == 0 or step % args.eval_every == 0):
+            if args.eval_every > 0 and len(val_dataset) > 0 and (step == 0 or step % args.eval_every == 0):
                 model.eval()
                 val_loss = evaluate_dataset(model, val_dataset, tokenizer, args.batch_size, args.max_seq_len, device, ddp_rank, ddp_world_size)
                 best_val_loss = min(best_val_loss, val_loss)
@@ -231,15 +308,20 @@ def main():
                 model.train()
 
             t0 = time.time()
-            loss = model(inputs, targets)
+            if valid_tokens.item() == 0:
+                loss_sum = model(inputs, targets) * 0.0
+            else:
+                loss_sum = model(inputs, targets, loss_reduction="sum")
+            loss = loss_sum * ddp_world_size / global_valid_tokens.clamp_min(1).to(loss_sum.dtype)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
             dt = time.time() - t0
 
-            loss_item = loss.detach()
+            loss_item = loss_sum.detach()
             if ddp:
-                dist.all_reduce(loss_item, op=dist.ReduceOp.AVG)
+                dist.all_reduce(loss_item, op=dist.ReduceOp.SUM)
+            loss_item = loss_item / global_valid_tokens.clamp_min(1)
             smooth_loss = ema_beta * smooth_loss + (1 - ema_beta) * loss_item.item()
             debiased = smooth_loss / (1 - ema_beta ** (step + 1))
             print0(
