@@ -12,6 +12,7 @@ Notable features:
 - Flash Attention 3 integration
 """
 
+import os
 from functools import partial
 from dataclasses import dataclass
 
@@ -24,6 +25,30 @@ from nanochat.optim import MuonAdamW, DistMuonAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
+
+_FP16_SAFE_MLP = os.environ.get("NANOCHAT_FP16_SAFE_MLP", "0") == "1"
+_FP16_SAFE_MLP_CLAMP = float(os.environ.get("NANOCHAT_FP16_SAFE_MLP_CLAMP", "128.0"))
+_FP16_SAFE_PROJ_CLAMP = float(os.environ.get("NANOCHAT_FP16_SAFE_PROJ_CLAMP", "1024.0"))
+_FP16_SAFE_RESID_CLAMP = float(os.environ.get("NANOCHAT_FP16_SAFE_RESID_CLAMP", "128.0"))
+
+
+def set_fp16_safe_mlp(enabled=None, clamp=None, proj_clamp=None, resid_clamp=None):
+    """Configure fp16-only clamps for squared-ReLU and residual-stream stability."""
+    global _FP16_SAFE_MLP, _FP16_SAFE_MLP_CLAMP, _FP16_SAFE_PROJ_CLAMP, _FP16_SAFE_RESID_CLAMP
+    if enabled is not None:
+        _FP16_SAFE_MLP = bool(enabled)
+    if clamp is not None:
+        _FP16_SAFE_MLP_CLAMP = float(clamp)
+    if proj_clamp is not None:
+        _FP16_SAFE_PROJ_CLAMP = float(proj_clamp)
+    if resid_clamp is not None:
+        _FP16_SAFE_RESID_CLAMP = float(resid_clamp)
+
+
+def fp16_safe_clamp(x, limit):
+    if _FP16_SAFE_MLP and x.dtype == torch.float16 and limit > 0:
+        return x.clamp(min=-float(limit), max=float(limit))
+    return x
 
 @dataclass
 class GPTConfig:
@@ -91,8 +116,10 @@ class CausalSelfAttention(nn.Module):
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+            ve = fp16_safe_clamp(ve, _FP16_SAFE_RESID_CLAMP)
             gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 3)
             v = v + gate.unsqueeze(-1) * ve
+        v = fp16_safe_clamp(v, _FP16_SAFE_PROJ_CLAMP)
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
@@ -121,8 +148,10 @@ class CausalSelfAttention(nn.Module):
                 kv_cache.advance(T)
 
         # Re-assemble the heads and project back to residual stream
+        y = fp16_safe_clamp(y, _FP16_SAFE_PROJ_CLAMP)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
+        y = fp16_safe_clamp(y, _FP16_SAFE_PROJ_CLAMP)
         return y
 
 
@@ -134,8 +163,15 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.relu(x).square()
+        if _FP16_SAFE_MLP and x.dtype == torch.float16:
+            # fp16 max is ~65504; ReLU^2 overflows once activations exceed ~256.
+            # Clipping well below that limit leaves headroom for the following projection.
+            clamp = min(_FP16_SAFE_MLP_CLAMP, 255.0)
+            x = F.relu(x).clamp(max=clamp).square()
+        else:
+            x = F.relu(x).square()
         x = self.c_proj(x)
+        x = fp16_safe_clamp(x, _FP16_SAFE_PROJ_CLAMP)
         return x
 
 
@@ -146,8 +182,8 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+        x = fp16_safe_clamp(x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache), _FP16_SAFE_RESID_CLAMP)
+        x = fp16_safe_clamp(x + self.mlp(norm(x)), _FP16_SAFE_RESID_CLAMP)
         return x
 
 
@@ -442,6 +478,7 @@ class GPT(nn.Module):
                 # Decode: single token, use cached prev embedding
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
                 x = x + gate * x_pre_smear
+        x = fp16_safe_clamp(x, _FP16_SAFE_RESID_CLAMP)
 
         # Forward the trunk of the Transformer
         x0 = x  # save initial normalized embedding for x0 residual
@@ -450,6 +487,7 @@ class GPT(nn.Module):
         x_backout = None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            x = fp16_safe_clamp(x, _FP16_SAFE_RESID_CLAMP)
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
@@ -457,6 +495,7 @@ class GPT(nn.Module):
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
+            x = fp16_safe_clamp(x, _FP16_SAFE_RESID_CLAMP)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
